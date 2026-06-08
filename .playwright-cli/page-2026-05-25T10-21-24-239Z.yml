@@ -1,0 +1,63 @@
+- generic [ref=e3]:
+  - complementary [ref=e4]:
+    - generic [ref=e5]:
+      - img [ref=e6]
+      - generic [ref=e8]: SSL证书监控
+    - navigation [ref=e9]:
+      - link "仪表盘" [ref=e10] [cursor=pointer]:
+        - /url: /dashboard
+        - img [ref=e11]
+        - generic [ref=e16]: 仪表盘
+      - link "证书列表" [ref=e17] [cursor=pointer]:
+        - /url: /certificates
+        - img [ref=e18]
+        - generic [ref=e21]: 证书列表
+      - link "告警管理" [ref=e22] [cursor=pointer]:
+        - /url: /alerts
+        - img [ref=e23]
+        - generic [ref=e26]: 告警管理
+      - link "目标管理" [ref=e27] [cursor=pointer]:
+        - /url: /targets
+        - img [ref=e28]
+        - generic [ref=e31]: 目标管理
+      - link "Agent目标" [ref=e32] [cursor=pointer]:
+        - /url: /agent-targets
+        - img [ref=e33]
+        - generic [ref=e36]: Agent目标
+      - link "凭证管理" [ref=e37] [cursor=pointer]:
+        - /url: /credential-manager
+        - img [ref=e38]
+        - generic [ref=e42]: 凭证管理
+      - link "系统设置" [ref=e43] [cursor=pointer]:
+        - /url: /settings
+        - img [ref=e44]
+        - generic [ref=e55]: 系统设置
+    - generic [ref=e56]:
+      - generic [ref=e57]:
+        - generic [ref=e59]: G
+        - generic [ref=e60]:
+          - paragraph [ref=e61]: gsadmin
+          - paragraph [ref=e62]: 管理员
+        - generic [ref=e63]: 管理
+      - generic [ref=e64]:
+        - button "刷新" [ref=e65] [cursor=pointer]:
+          - img [ref=e66]
+          - generic [ref=e71]: 刷新
+        - button "退出" [ref=e72] [cursor=pointer]:
+          - img [ref=e73]
+          - generic [ref=e76]: 退出
+    - button "收起菜单" [ref=e77] [cursor=pointer]:
+      - img [ref=e78]
+  - generic [ref=e80]:
+    - banner [ref=e81]:
+      - generic [ref=e82]:
+        - img [ref=e83]
+        - generic [ref=e85]: /
+        - generic [ref=e86]: Agent目标
+      - generic [ref=e88]:
+        - img [ref=e89]
+        - text: 管理员
+    - main [ref=e92]:
+      - generic [ref=e94]:
+        - img [ref=e95]
+        - paragraph [ref=e100]: 加载中...

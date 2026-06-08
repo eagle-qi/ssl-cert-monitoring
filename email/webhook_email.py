@@ -30,6 +30,9 @@ SMTP_USE_TLS = os.getenv('SMTP_USE_TLS', 'true').lower() == 'true'
 # 配置文件路径 - 支持多个配置文件
 CONFIG_PATHS = os.getenv('TARGETS_CONFIG_PATH', '/app/data/ssl_targets.json,/app/data/agent_targets.json').split(',')
 
+# 凭证配置路径
+CREDENTIALS_CONFIG_PATH = os.getenv('CREDENTIALS_CONFIG_PATH', '/app/data/credentials.json')
+
 
 def load_targets_config():
     """加载目标配置（支持多个配置文件）"""
@@ -56,6 +59,20 @@ def load_targets_config():
     return combined
 
 
+def load_credentials_config():
+    """加载凭证配置"""
+    try:
+        if os.path.exists(CREDENTIALS_CONFIG_PATH):
+            with open(CREDENTIALS_CONFIG_PATH, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                credentials = data.get('credentials', [])
+                logger.info(f"已加载凭证配置: {CREDENTIALS_CONFIG_PATH}, 凭证数: {len(credentials)}")
+                return credentials
+    except Exception as e:
+        logger.error(f"加载凭证配置 {CREDENTIALS_CONFIG_PATH} 失败: {e}")
+    return []
+
+
 def build_targets_map(config):
     """构建 URL -> 目标信息 的映射"""
     targets_map = {}
@@ -69,6 +86,26 @@ def build_targets_map(config):
 def get_owner_email(alert):
     """从告警标签获取负责人邮箱"""
     labels = alert.get('labels', {})
+    alert_type = labels.get('alert_type', '')
+    
+    # 凭证管理告警 - 直接使用标签中的 owner_email 或从凭证配置查找
+    if alert_type == 'credential':
+        # 优先使用标签中的 owner_email
+        owner_email = labels.get('owner_email', '')
+        if owner_email:
+            return owner_email
+        # 从凭证配置查找
+        credential_name = labels.get('credential_name', '')
+        if credential_name:
+            credentials = load_credentials_config()
+            for cred in credentials:
+                if cred.get('name', '') == credential_name:
+                    email = cred.get('owner_email', '')
+                    if email:
+                        return email
+        return None
+    
+    # SSL 证书告警 - 原有逻辑
     
     # 优先使用 target_url 标签（已通过 metric_relabel_configs 设置）
     target_url = labels.get('target_url', '')
@@ -186,9 +223,16 @@ def send_email(to_email, subject, html_body):
 
 
 def build_email_content(alerts, status='firing'):
-    """构建邮件内容"""
+    """构建邮件内容 - 根据 alert_type 区分 SSL 证书告警和凭证管理告警"""
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     
+    # 检查是否为凭证管理告警
+    is_credential = any(a.get('labels', {}).get('alert_type') == 'credential' for a in alerts)
+    
+    if is_credential:
+        return build_credential_email_content(alerts, status, now)
+    
+    # ========== SSL 证书告警（原有逻辑） ==========
     # 统计告警严重程度
     critical_count = sum(1 for a in alerts if a.get('labels', {}).get('severity') == 'critical')
     warning_count = sum(1 for a in alerts if a.get('labels', {}).get('severity') == 'warning')
@@ -381,6 +425,199 @@ def build_email_content(alerts, status='firing'):
     return html
 
 
+def build_credential_email_content(alerts, status='firing', now=None):
+    """构建凭证管理告警邮件内容"""
+    if not now:
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    critical_count = sum(1 for a in alerts if a.get('labels', {}).get('severity') == 'critical')
+    warning_count = sum(1 for a in alerts if a.get('labels', {}).get('severity') == 'warning')
+    
+    # 凭证类型映射
+    type_labels = {
+        'cert': 'SSL证书', 'key': '密钥', 'auth': '授权', 'password': '口令/密码'
+    }
+    
+    alert_rows = ""
+    for alert in alerts:
+        labels = alert.get('labels', {})
+        annotations = alert.get('annotations', {})
+        
+        alertname = labels.get('alertname', '未知告警')
+        severity = labels.get('severity', 'warning')
+        credential_name = labels.get('credential_name', '未知')
+        credential_type = type_labels.get(labels.get('credential_type', ''), labels.get('credential_type', '未知'))
+        service_name = labels.get('service_name', '未知')
+        owner = labels.get('owner', '未知')
+        env = labels.get('env', '未知')
+        description = annotations.get('description', '')
+        if not description:
+            description = annotations.get('summary', '无详细信息')
+        
+        severity_color = '#dc2626' if severity == 'critical' else '#f59e0b'
+        severity_bg = '#fef2f2' if severity == 'critical' else '#fffbeb'
+        status_text = '🔴 告警中' if status == 'firing' else '✅ 已恢复'
+        
+        # 提取剩余天数
+        import re
+        days_left = ''
+        match = re.search(r'(\d+\.?\d*)\s*天', description)
+        if match:
+            days = float(match.group(1))
+            if days < 0:
+                days_left = f'<span style="color: #dc2626; font-weight: bold;">已过期 {-days:.0f} 天</span>'
+            elif days < 7:
+                days_left = f'<span style="color: #dc2626; font-weight: bold;">{days:.1f} 天</span>'
+            elif days < 30:
+                days_left = f'<span style="color: #f59e0b; font-weight: bold;">{days:.1f} 天</span>'
+            else:
+                days_left = f'{days:.1f} 天'
+        
+        alert_rows += f"""
+        <tr style="background: {severity_bg};">
+            <td style="padding: 12px; border: 1px solid #e5e7eb;">{alertname}</td>
+            <td style="padding: 12px; border: 1px solid #e5e7eb;">
+                <span style="color: {severity_color}; font-weight: bold;">{severity.upper()}</span>
+            </td>
+            <td style="padding: 12px; border: 1px solid #e5e7eb;">{status_text}</td>
+            <td style="padding: 12px; border: 1px solid #e5e7eb;">{credential_name}</td>
+            <td style="padding: 12px; border: 1px solid #e5e7eb;">{credential_type}</td>
+            <td style="padding: 12px; border: 1px solid #e5e7eb;">{days_left}</td>
+            <td style="padding: 12px; border: 1px solid #e5e7eb;">{service_name}</td>
+            <td style="padding: 12px; border: 1px solid #e5e7eb;">{owner}</td>
+        </tr>
+        """
+    
+    # 告警详情卡片
+    alert_details = ""
+    for alert in alerts:
+        labels = alert.get('labels', {})
+        annotations = alert.get('annotations', {})
+        credential_name = labels.get('credential_name', '未知')
+        credential_type = type_labels.get(labels.get('credential_type', ''), labels.get('credential_type', '未知'))
+        service_name = labels.get('service_name', '未知')
+        owner = labels.get('owner', '未知')
+        env = labels.get('env', '未知')
+        description = annotations.get('description', '')
+        if not description:
+            description = annotations.get('summary', '无详细信息')
+        severity = labels.get('severity', 'warning')
+        
+        severity_color = '#dc2626' if severity == 'critical' else '#f59e0b'
+        severity_icon = '🔴' if severity == 'critical' else '⚠️'
+        
+        alert_details += f"""
+                <div style="margin-bottom: 20px; padding: 15px; background: white; border-radius: 8px; border-left: 4px solid {severity_color}; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                        <h4 style="margin: 0; color: #333;">{severity_icon} {credential_name}</h4>
+                        <span style="background: {severity_color}; color: white; padding: 4px 12px; border-radius: 12px; font-size: 12px;">{severity.upper()}</span>
+                    </div>
+                    <p style="margin: 5px 0; color: #666; font-size: 14px;">
+                        <strong>凭证类型:</strong> {credential_type}
+                    </p>
+                    <p style="margin: 5px 0; color: #666; font-size: 14px;">
+                        <strong>所属服务:</strong> {service_name}
+                    </p>
+                    <p style="margin: 5px 0; color: #666; font-size: 14px;">
+                        <strong>环境:</strong> {env}
+                    </p>
+                    <p style="margin: 5px 0; color: #666; font-size: 14px;">
+                        <strong>负责人:</strong> {owner}
+                    </p>
+                    <p style="margin: 10px 0; padding: 10px; background: #f3f4f6; border-radius: 4px; font-size: 14px; color: #333;">
+                        {description}
+                    </p>
+                </div>
+        """
+    
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <style>
+            body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; line-height: 1.6; color: #333; background: #f0f2f5; }}
+            .container {{ max-width: 900px; margin: 0 auto; padding: 20px; }}
+            .header {{ background: linear-gradient(135deg, #7c3aed 0%, #2563eb 100%); color: white; padding: 25px 30px; border-radius: 12px 12px 0 0; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
+            .header h1 {{ margin: 0 0 10px 0; font-size: 24px; display: flex; align-items: center; gap: 10px; }}
+            .header p {{ margin: 0; opacity: 0.9; font-size: 14px; }}
+            .content {{ background: white; padding: 25px 30px; border-radius: 0 0 12px 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
+            .stats {{ display: flex; gap: 20px; margin-bottom: 25px; }}
+            .stat-card {{ flex: 1; padding: 15px; border-radius: 8px; text-align: center; }}
+            .stat-critical {{ background: #fef2f2; border: 1px solid #fecaca; }}
+            .stat-warning {{ background: #fffbeb; border: 1px solid #fde68a; }}
+            .stat-total {{ background: #f0f9ff; border: 1px solid #bae6fd; }}
+            .stat-number {{ font-size: 28px; font-weight: bold; }}
+            .stat-label {{ font-size: 12px; color: #666; margin-top: 5px; }}
+            table {{ width: 100%; border-collapse: collapse; margin-bottom: 25px; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
+            th {{ background: #1f2937; color: white; padding: 12px; text-align: left; font-weight: 500; font-size: 13px; }}
+            td {{ padding: 12px; border-bottom: 1px solid #e5e7eb; font-size: 13px; }}
+            tr:last-child td {{ border-bottom: none; }}
+            .footer {{ margin-top: 25px; text-align: center; color: #9ca3af; font-size: 12px; padding-top: 20px; border-top: 1px solid #e5e7eb; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>🔐 凭证管理告警通知</h1>
+                <p>通知时间: {now}</p>
+            </div>
+            <div class="content">
+                <div class="stats">
+                    <div class="stat-card stat-critical">
+                        <div class="stat-number" style="color: #dc2626;">{critical_count}</div>
+                        <div class="stat-label">严重告警</div>
+                    </div>
+                    <div class="stat-card stat-warning">
+                        <div class="stat-number" style="color: #f59e0b;">{warning_count}</div>
+                        <div class="stat-label">警告告警</div>
+                    </div>
+                    <div class="stat-card stat-total">
+                        <div class="stat-number" style="color: #3b82f6;">{len(alerts)}</div>
+                        <div class="stat-label">总计告警</div>
+                    </div>
+                </div>
+                
+                <h3 style="margin-bottom: 15px; color: #1f2937; border-bottom: 2px solid #e5e7eb; padding-bottom: 10px;">📋 凭证告警列表</h3>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>告警名称</th>
+                            <th>严重程度</th>
+                            <th>状态</th>
+                            <th>凭证名称</th>
+                            <th>凭证类型</th>
+                            <th>剩余天数</th>
+                            <th>所属服务</th>
+                            <th>负责人</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {alert_rows}
+                    </tbody>
+                </table>
+                
+                <h3 style="margin: 25px 0 15px 0; color: #1f2937; border-bottom: 2px solid #e5e7eb; padding-bottom: 10px;">📝 告警详情</h3>
+                <div style="margin-bottom: 20px;">
+                    {alert_details}
+                </div>
+                
+                <div style="text-align: center; margin-top: 20px;">
+                    <p style="color: #666; font-size: 14px;">请及时处理以上凭证告警，确保相关凭证正常可用</p>
+                </div>
+            </div>
+            <div class="footer">
+                <p>由 SSL Certificate Monitoring System 自动发送</p>
+                <p>如需管理告警规则或凭证配置，请访问监控系统管理后台</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    
+    return html
+
+
 def group_alerts_by_email(alerts):
     """按负责人邮箱分组告警"""
     groups = {}
@@ -429,7 +666,11 @@ def receive_alertmanager_webhook():
             if email_alerts and email_alerts[0].get('status') == 'resolved':
                 status = 'resolved'
             
-            subject = f"🔔 SSL证书告警 - {len(email_alerts)}条" if status == 'firing' else f"✅ SSL证书告警恢复 - {len(email_alerts)}条"
+            is_credential = any(a.get('labels', {}).get('alert_type') == 'credential' for a in email_alerts)
+            if is_credential:
+                subject = f"🔐 凭证管理告警 - {len(email_alerts)}条" if status == 'firing' else f"✅ 凭证管理告警恢复 - {len(email_alerts)}条"
+            else:
+                subject = f"🔔 SSL证书告警 - {len(email_alerts)}条" if status == 'firing' else f"✅ SSL证书告警恢复 - {len(email_alerts)}条"
             html_body = build_email_content(email_alerts, status)
             
             if email == 'default':

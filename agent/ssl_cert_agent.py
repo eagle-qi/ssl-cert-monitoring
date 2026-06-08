@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
 """
 SSL Certificate Agent - 内网证书采集端
-部署在内网，定时采集 SSL 证书信息，暴露 HTTP API 供 Server 拉取
+部署在内网，定时采集 SSL 证书信息
+
+支持三种模式：
+1. 推送模式（push，默认）：Agent 主动向 Server 推送指标和心跳，不需要暴露端口
+2. 拉取模式（pull）：Agent 暴露 HTTP API 供 Server 拉取数据
+3. 双模式（dual）：同时暴露端口供 Server 拉取，又主动推送数据到 Server（推荐）
 
 功能：
 1. 定时检测 SSL 证书
-2. 存储指标数据到本地
-3. 暴露 HTTP API 供 Server 拉取数据
-4. 离线缓存，网络恢复后自动补报
+2. 主动推送指标数据到 Server（push/dual 模式）
+3. 定期发送心跳到 Server（push/dual 模式）
+4. 暴露 HTTP API 供 Server 拉取（pull/dual 模式）
+5. 从 Server 同步目标配置
+6. 离线缓存，网络恢复后自动补推
 """
 
 import json
@@ -34,7 +41,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Flask 应用
+# Flask 应用（pull/dual 模式下启动 HTTP 服务）
 app = Flask(__name__)
 
 # 默认配置
@@ -47,18 +54,54 @@ DEFAULT_CONFIG = {
     'offline_cache_size': 1000,
     'listen_host': '0.0.0.0',
     'listen_port': 8091,
-    'server_url': '',  # Server 地址，用于同步目标配置
+    'server_url': '',  # Server 地址，用于推送数据和同步目标配置
     'sync_interval': 300,  # 目标同步间隔（秒）
     'enable_https': False,  # Agent 是否启用 HTTPS
     'verify_ssl': True,  # 是否验证 Server SSL 证书
+    'push_mode': True,  # 推送模式（默认启用，Agent 不需要暴露端口）
+    'push_interval': 30,  # 指标推送间隔（秒），检测完成后也会立即推送
+    'heartbeat_timeout': 300,  # Server 端判断 Agent 离线的心跳超时（秒）
 }
+
+# 运行模式: push / pull / dual
+AGENT_MODE = 'push'  # 默认推送模式
 
 # 全局变量
 AGENT_CONFIG = None
 METRICS_BUFFER = []
+PUSH_QUEUE = []  # 待推送的指标队列
 METRICS_LOCK = threading.Lock()
+PUSH_LOCK = threading.Lock()
 SCRAPE_INTERVAL = 180
 TARGETS_LAST_SYNC = None  # 上次同步时间
+LAST_PUSH_TIME = None  # 上次推送时间
+
+
+def _resolve_agent_mode():
+    """根据 AGENT_MODE 和 push_mode 配置解析实际运行模式
+    支持三种模式：
+    - push:  仅推送，不暴露端口
+    - pull:  仅拉取，暴露端口，不推送
+    - dual:  同时暴露端口+推送（推荐，兼顾两种架构）
+    """
+    global AGENT_MODE
+    
+    mode = os.getenv('AGENT_MODE', '').lower()
+    
+    if mode in ('push', 'pull', 'dual'):
+        AGENT_MODE = mode
+    else:
+        # 兼容旧的 AGENT_PUSH_MODE 环境变量
+        push_mode = os.getenv('AGENT_PUSH_MODE', '').lower()
+        if push_mode == 'true':
+            AGENT_MODE = 'push'
+        elif push_mode == 'false':
+            AGENT_MODE = 'pull'
+        else:
+            # 使用默认配置中的 push_mode
+            AGENT_MODE = 'push' if DEFAULT_CONFIG['push_mode'] else 'pull'
+    
+    return AGENT_MODE
 
 
 def _load_config(config_path=None):
@@ -71,10 +114,17 @@ def _load_config(config_path=None):
             # 补充环境变量配置
             config['server_url'] = os.getenv('SERVER_URL', config.get('server_url', ''))
             config['sync_interval'] = int(os.getenv('SYNC_INTERVAL', config.get('sync_interval', DEFAULT_CONFIG['sync_interval'])))
+            # 模式配置: 优先使用 AGENT_MODE，其次兼容 AGENT_PUSH_MODE
+            mode_from_env = os.getenv('AGENT_MODE', '').lower()
+            if mode_from_env in ('push', 'pull', 'dual'):
+                config['agent_mode'] = mode_from_env
+            else:
+                config['push_mode'] = os.getenv('AGENT_PUSH_MODE', str(config.get('push_mode', DEFAULT_CONFIG['push_mode']))).lower() == 'true'
+            config['push_interval'] = int(os.getenv('PUSH_INTERVAL', config.get('push_interval', DEFAULT_CONFIG['push_interval'])))
             # HTTPS 配置
             config['enable_https'] = os.getenv('AGENT_ENABLE_HTTPS', str(config.get('enable_https', DEFAULT_CONFIG['enable_https']))).lower() == 'true'
             config['verify_ssl'] = os.getenv('AGENT_VERIFY_SSL', str(config.get('verify_ssl', DEFAULT_CONFIG['verify_ssl']))).lower() == 'true'
-            config['targets'] = _load_targets()
+            config['targets'] = []  # 不再从本地文件读取，启动后由 Server 实时下发
             return config
         except Exception as e:
             logger.error(f"加载配置失败: {e}")
@@ -87,39 +137,19 @@ def _load_config(config_path=None):
     config['listen_port'] = int(os.getenv('AGENT_LISTEN_PORT', DEFAULT_CONFIG['listen_port']))
     config['server_url'] = os.getenv('SERVER_URL', '')  # Server 地址
     config['sync_interval'] = int(os.getenv('SYNC_INTERVAL', DEFAULT_CONFIG['sync_interval']))
+    # 模式配置: 优先使用 AGENT_MODE，其次兼容 AGENT_PUSH_MODE
+    mode_from_env = os.getenv('AGENT_MODE', '').lower()
+    if mode_from_env in ('push', 'pull', 'dual'):
+        config['agent_mode'] = mode_from_env
+    else:
+        config['push_mode'] = os.getenv('AGENT_PUSH_MODE', str(DEFAULT_CONFIG['push_mode'])).lower() == 'true'
+    config['push_interval'] = int(os.getenv('PUSH_INTERVAL', DEFAULT_CONFIG['push_interval']))
     # HTTPS 配置
     config['enable_https'] = os.getenv('AGENT_ENABLE_HTTPS', str(DEFAULT_CONFIG['enable_https'])).lower() == 'true'
     config['verify_ssl'] = os.getenv('AGENT_VERIFY_SSL', str(DEFAULT_CONFIG['verify_ssl'])).lower() == 'true'
-    config['targets'] = _load_targets()
+    config['targets'] = []  # 不再从本地文件读取，启动后由 Server 实时下发
     
     return config
-
-
-def _load_targets():
-    """加载监控目标"""
-    targets_path = os.getenv('AGENT_TARGETS_PATH', '/app/data/targets.json')
-    if os.path.exists(targets_path):
-        try:
-            with open(targets_path, 'r') as f:
-                data = json.load(f)
-                return data.get('targets', [])
-        except Exception as e:
-            logger.error(f"加载目标失败: {e}")
-    
-    # 返回默认测试目标
-    return []
-
-
-def _save_targets_to_file(targets):
-    """保存目标到本地文件（缓存）"""
-    targets_path = os.getenv('AGENT_TARGETS_PATH', '/app/data/targets.json')
-    try:
-        os.makedirs(os.path.dirname(targets_path), exist_ok=True)
-        with open(targets_path, 'w') as f:
-            json.dump({'targets': targets}, f, ensure_ascii=False, indent=2)
-        logger.info(f"目标配置已保存到 {targets_path}")
-    except Exception as e:
-        logger.error(f"保存目标配置失败: {e}")
 
 
 def _sync_targets_from_server():
@@ -162,14 +192,11 @@ def _sync_targets_from_server():
             if data.get('status') == 'success':
                 targets = data.get('targets', [])
                 
-                # 更新配置
+                # 更新配置（仅内存，不再写本地文件）
                 AGENT_CONFIG['targets'] = targets
                 
-                # 保存到本地文件（离线缓存）
-                _save_targets_to_file(targets)
-                
                 TARGETS_LAST_SYNC = datetime.datetime.now()
-                logger.info(f"成功同步 {len(targets)} 个目标配置")
+                logger.info(f"成功从 Server 同步 {len(targets)} 个目标配置")
             else:
                 logger.warning(f"Server 返回错误: {data.get('message', '未知错误')}")
         else:
@@ -265,7 +292,7 @@ def _get_system_info():
     return {
         'hostname': hostname,
         'ip': ip,
-        'version': '1.0',
+        'version': '2.0',
         'platform': sys.platform
     }
 
@@ -545,19 +572,223 @@ def scrape():
     for m in all_metrics:
         m['timestamp'] = timestamp
     
-    # 更新缓存
+    # 更新本地缓存
     with METRICS_LOCK:
         METRICS_BUFFER.extend(all_metrics)
         # 保留最近 1000 条
         if len(METRICS_BUFFER) > 1000:
             METRICS_BUFFER = METRICS_BUFFER[-1000:]
     
+    # push/dual 模式下，将指标加入推送队列
+    if AGENT_MODE in ('push', 'dual'):
+        with PUSH_LOCK:
+            PUSH_QUEUE.extend(all_metrics)
+            # 限制推送队列大小
+            if len(PUSH_QUEUE) > 1000:
+                PUSH_QUEUE[:] = PUSH_QUEUE[-1000:]
+    
     logger.info(f"检测完成，共 {len(all_metrics)} 条指标")
     
     return all_metrics
 
 
-# ========== HTTP API 接口 ==========
+# ========== 推送模式功能 ==========
+
+def _get_server_url():
+    """获取 Server URL（处理 HTTPS）"""
+    server_url = AGENT_CONFIG.get('server_url', '')
+    if not server_url:
+        return None
+    
+    enable_https = AGENT_CONFIG.get('enable_https', False)
+    if enable_https and server_url.startswith('http://'):
+        server_url = server_url.replace('http://', 'https://')
+    
+    return server_url
+
+
+def push_metrics_to_server():
+    """主动推送指标数据到 Server"""
+    global LAST_PUSH_TIME
+    
+    server_url = _get_server_url()
+    if not server_url:
+        logger.debug("未配置 SERVER_URL，跳过指标推送")
+        return False
+    
+    verify_ssl = AGENT_CONFIG.get('verify_ssl', True)
+    agent_id = os.getenv('AGENT_ID', '')
+    sys_info = _get_system_info()
+    
+    # 从推送队列获取待推送的指标
+    with PUSH_LOCK:
+        metrics_to_push = list(PUSH_QUEUE)
+    
+    if not metrics_to_push:
+        logger.debug("没有待推送的指标")
+        return True
+    
+    url = f"{server_url}/api/v1/agents/{agent_id}/metrics"
+    
+    payload = {
+        'agent_id': agent_id,
+        'agent_info': sys_info,
+        'metrics': metrics_to_push,
+        'count': len(metrics_to_push),
+        'agent_mode': AGENT_MODE,
+    }
+    
+    try:
+        logger.info(f"推送 {len(metrics_to_push)} 条指标到 Server: {url}")
+        resp = requests.post(url, json=payload, timeout=30, verify=verify_ssl)
+        
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get('status') == 'success':
+                # 推送成功，清空已推送的指标
+                with PUSH_LOCK:
+                    # 只清除已推送的数量（可能期间有新的指标加入）
+                    pushed_count = len(metrics_to_push)
+                    if len(PUSH_QUEUE) >= pushed_count:
+                        PUSH_QUEUE[:] = PUSH_QUEUE[pushed_count:]
+                    else:
+                        PUSH_QUEUE.clear()
+                
+                LAST_PUSH_TIME = datetime.datetime.now()
+                logger.info(f"成功推送 {len(metrics_to_push)} 条指标到 Server")
+                return True
+            else:
+                logger.warning(f"Server 返回错误: {data.get('message', '未知错误')}")
+                return False
+        else:
+            logger.warning(f"指标推送失败: HTTP {resp.status_code}")
+            return False
+            
+    except requests.exceptions.ConnectionError:
+        logger.warning("无法连接到 Server，指标将缓存在本地等待重试")
+        return False
+    except requests.exceptions.Timeout:
+        logger.warning("Server 连接超时，指标将缓存在本地等待重试")
+        return False
+    except Exception as e:
+        logger.error(f"推送指标失败: {e}")
+        return False
+
+
+def push_heartbeat_to_server():
+    """定期向 Server 发送心跳"""
+    server_url = _get_server_url()
+    if not server_url:
+        logger.debug("未配置 SERVER_URL，跳过心跳")
+        return False
+    
+    verify_ssl = AGENT_CONFIG.get('verify_ssl', True)
+    agent_id = os.getenv('AGENT_ID', '')
+    sys_info = _get_system_info()
+    
+    url = f"{server_url}/api/v1/agents/{agent_id}/heartbeat"
+    
+    payload = {
+        'agent_id': agent_id,
+        'agent_info': sys_info,
+        'targets_count': len(AGENT_CONFIG.get('targets', [])),
+        'metrics_buffer_size': len(METRICS_BUFFER),
+        'push_queue_size': len(PUSH_QUEUE),
+        'config': {
+            'scrape_interval': AGENT_CONFIG.get('scrape_interval', DEFAULT_CONFIG['scrape_interval']),
+            'push_mode': AGENT_MODE in ('push', 'dual'),
+            'agent_mode': AGENT_MODE,
+        },
+        'local_targets': [{'url': t.get('url', ''), 'service_name': t.get('service_name', '')} for t in AGENT_CONFIG.get('targets', [])],
+    }
+    
+    try:
+        logger.debug(f"发送心跳到 Server: {url}")
+        resp = requests.post(url, json=payload, timeout=10, verify=verify_ssl)
+        
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get('status') == 'success':
+                logger.debug("心跳发送成功")
+                return True
+            else:
+                logger.warning(f"心跳返回错误: {data.get('message', '未知错误')}")
+                return False
+        else:
+            logger.warning(f"心跳发送失败: HTTP {resp.status_code}")
+            return False
+            
+    except requests.exceptions.ConnectionError:
+        logger.debug("无法连接到 Server，心跳发送失败")
+        return False
+    except requests.exceptions.Timeout:
+        logger.debug("Server 心跳连接超时")
+        return False
+    except Exception as e:
+        logger.error(f"心跳发送失败: {e}")
+        return False
+
+
+def _push_loop():
+    """推送模式主循环：定时检测 + 推送指标 + 心跳"""
+    global SCRAPE_INTERVAL, TARGETS_LAST_SYNC
+    
+    SCRAPE_INTERVAL = AGENT_CONFIG.get('scrape_interval', DEFAULT_CONFIG['scrape_interval'])
+    sync_interval = AGENT_CONFIG.get('sync_interval', DEFAULT_CONFIG['sync_interval'])
+    heartbeat_interval = AGENT_CONFIG.get('heartbeat_interval', DEFAULT_CONFIG['heartbeat_interval'])
+    push_interval = AGENT_CONFIG.get('push_interval', DEFAULT_CONFIG['push_interval'])
+    
+    # 启动时先尝试同步目标配置
+    _sync_targets_from_server()
+    
+    # 立即执行一次检测
+    scrape()
+    
+    # 检测后立即推送
+    push_metrics_to_server()
+    
+    # 发送一次心跳
+    push_heartbeat_to_server()
+    
+    last_scrape_time = time.time()
+    last_heartbeat_time = time.time()
+    last_push_time = time.time()
+    last_sync_time = time.time()
+    
+    while True:
+        try:
+            time.sleep(5)  # 每5秒检查一次
+            now = time.time()
+            
+            # 1. 定时检测：检测前先从 Server 实时拉取最新目标（不再读本地文件）
+            if now - last_scrape_time >= SCRAPE_INTERVAL:
+                _sync_targets_from_server()
+                scrape()
+                last_scrape_time = now
+                
+                # 检测后立即推送
+                push_metrics_to_server()
+                last_push_time = now
+            
+            # 3. 定时推送缓存指标（如果推送队列有数据）
+            if now - last_push_time >= push_interval:
+                with PUSH_LOCK:
+                    has_pending = len(PUSH_QUEUE) > 0
+                if has_pending:
+                    push_metrics_to_server()
+                last_push_time = now
+            
+            # 4. 定时心跳
+            if now - last_heartbeat_time >= heartbeat_interval:
+                push_heartbeat_to_server()
+                last_heartbeat_time = now
+                
+        except Exception as e:
+            logger.error(f"推送循环异常: {e}")
+            time.sleep(10)
+
+
+# ========== HTTP API 接口（拉取模式兼容） ==========
 
 @app.route('/health')
 def health():
@@ -565,6 +796,7 @@ def health():
     return jsonify({
         'status': 'healthy',
         'service': 'ssl-cert-agent',
+        'mode': AGENT_MODE,
         'targets_count': len(AGENT_CONFIG.get('targets', [])),
         'metrics_buffer_size': len(METRICS_BUFFER)
     })
@@ -579,7 +811,9 @@ def info():
         'agent_info': sys_info,
         'config': {
             'scrape_interval': SCRAPE_INTERVAL,
-            'targets_count': len(AGENT_CONFIG.get('targets', []))
+            'targets_count': len(AGENT_CONFIG.get('targets', [])),
+            'agent_mode': AGENT_MODE,
+            'push_mode': AGENT_MODE in ('push', 'dual'),
         }
     })
 
@@ -588,7 +822,7 @@ def info():
 def metrics():
     """
     Prometheus 格式的指标数据
-    供 Server 拉取使用
+    供 Server 拉取使用（拉取模式兼容）
     """
     with METRICS_LOCK:
         current_metrics = list(METRICS_BUFFER)
@@ -667,7 +901,7 @@ def metrics():
 def api_targets():
     """
     返回 Agent 本地配置的目标列表
-    供 Server 自动发现和同步使用
+    供 Server 自动发现和同步使用（拉取模式兼容）
     """
     targets = AGENT_CONFIG.get('targets', [])
     sys_info = _get_system_info()
@@ -701,7 +935,7 @@ def api_targets():
 
 @app.route('/api/v1/metrics')
 def api_metrics():
-    """JSON 格式的指标数据"""
+    """JSON 格式的指标数据（拉取模式兼容）"""
     with METRICS_LOCK:
         current_metrics = list(METRICS_BUFFER)
     
@@ -712,6 +946,64 @@ def api_metrics():
         'agent_info': sys_info,
         'metrics': current_metrics,
         'count': len(current_metrics),
+        'timestamp': datetime.datetime.now().isoformat()
+    })
+
+
+@app.route('/api/v1/check', methods=['POST'])
+def api_check_target():
+    """
+    按需检测单个目标证书（供 Server 代理检测使用）
+    请求体: {
+        "url": "https://www.google.com",
+        "timeout": 30,
+        "service_name": "google",
+        "owner": "xxx",
+        "owner_email": "xx@xx.com",
+        "env": "production"
+    }
+    返回: agent 检测后的 metrics 列表
+    """
+    try:
+        data = request.get_json(force=True)
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': f'无效的请求体: {e}',
+            'metrics': []
+        }), 400
+    
+    url = data.get('url', '')
+    if not url:
+        return jsonify({
+            'status': 'error',
+            'message': '缺少 url 参数',
+            'metrics': []
+        }), 400
+    
+    # 构造 target 对象传给 _check_cert
+    target = {
+        'url': url,
+        'timeout': data.get('timeout', 30),
+        'service_name': data.get('service_name', url),
+        'owner': data.get('owner', 'unknown'),
+        'owner_email': data.get('owner_email', ''),
+        'env': data.get('env', 'production')
+    }
+    
+    logger.info(f"[代理检测] Server 请求检测: {url}")
+    metrics = _check_cert(target)
+    logger.info(f"[代理检测] {url} 检测完成, 结果数: {len(metrics)}")
+    
+    # 同时将结果存入本地缓冲区
+    with METRICS_LOCK:
+        METRICS_BUFFER.extend(metrics)
+    
+    return jsonify({
+        'status': 'success',
+        'url': url,
+        'metrics': metrics,
+        'count': len(metrics),
         'timestamp': datetime.datetime.now().isoformat()
     })
 
@@ -727,7 +1019,7 @@ def _build_labels(metric, label_keys):
 
 
 def _scrape_loop():
-    """定时检测循环"""
+    """定时检测循环（拉取模式）"""
     global SCRAPE_INTERVAL, TARGETS_LAST_SYNC
     SCRAPE_INTERVAL = AGENT_CONFIG.get('scrape_interval', DEFAULT_CONFIG['scrape_interval'])
     sync_interval = AGENT_CONFIG.get('sync_interval', DEFAULT_CONFIG['sync_interval'])
@@ -742,10 +1034,8 @@ def _scrape_loop():
         try:
             time.sleep(SCRAPE_INTERVAL)
             
-            # 检查是否需要同步目标配置
-            if TARGETS_LAST_SYNC is None or \
-               (datetime.datetime.now() - TARGETS_LAST_SYNC).total_seconds() >= sync_interval:
-                _sync_targets_from_server()
+            # 检测前从 Server 实时拉取最新目标（不再读本地文件）
+            _sync_targets_from_server()
             
             # 执行检测
             scrape()
@@ -756,7 +1046,7 @@ def _scrape_loop():
 
 def main():
     """主函数"""
-    global AGENT_CONFIG
+    global AGENT_CONFIG, AGENT_MODE
     
     import argparse
     
@@ -766,6 +1056,7 @@ def main():
     parser.add_argument('-t', '--timeout', type=int, help='连接超时（秒）')
     parser.add_argument('-p', '--port', type=int, help='监听端口')
     parser.add_argument('--host', default='0.0.0.0', help='监听地址')
+    parser.add_argument('-m', '--mode', choices=['push', 'pull', 'dual'], help='运行模式: push/pull/dual')
     
     args = parser.parse_args()
     
@@ -786,37 +1077,123 @@ def main():
     if args.host:
         AGENT_CONFIG['listen_host'] = args.host
     
-    listen_host = AGENT_CONFIG.get('listen_host', DEFAULT_CONFIG['listen_host'])
-    listen_port = AGENT_CONFIG.get('listen_port', DEFAULT_CONFIG['listen_port'])
-    enable_https = AGENT_CONFIG.get('enable_https', False)
+    # 解析运行模式
+    if args.mode:
+        AGENT_MODE = args.mode
+    else:
+        # 优先使用 AGENT_MODE 环境变量
+        mode_env = os.getenv('AGENT_MODE', '').lower()
+        if mode_env in ('push', 'pull', 'dual'):
+            AGENT_MODE = mode_env
+        else:
+            # 兼容旧的 AGENT_PUSH_MODE
+            _resolve_agent_mode()
+            # 同时检查配置文件中的 agent_mode
+            config_mode = AGENT_CONFIG.get('agent_mode', '')
+            if config_mode in ('push', 'pull', 'dual'):
+                AGENT_MODE = config_mode
+    
+    # push/dual 模式需要 server_url
+    needs_server = AGENT_MODE in ('push', 'dual')
     
     logger.info("=" * 60)
     logger.info("SSL Certificate Agent 启动")
-    logger.info(f"监听地址: {listen_host}:{listen_port}")
-    if enable_https:
+    logger.info(f"工作模式: {AGENT_MODE}")
+    
+    mode_desc = {
+        'push': '推送模式（Agent 主动推送，不需要暴露端口）',
+        'pull': '拉取模式（Server 主动拉取，需要暴露端口）',
+        'dual': '双模式（同时暴露端口 + 主动推送，推荐）'
+    }
+    logger.info(f"模式说明: {mode_desc.get(AGENT_MODE, '')}")
+    
+    if AGENT_MODE in ('pull', 'dual'):
+        listen_host = AGENT_CONFIG.get('listen_host', DEFAULT_CONFIG['listen_host'])
+        listen_port = AGENT_CONFIG.get('listen_port', DEFAULT_CONFIG['listen_port'])
+        logger.info(f"监听地址: {listen_host}:{listen_port}")
+    
+    if AGENT_CONFIG.get('enable_https'):
         logger.info("协议: HTTPS (启用)")
     else:
         logger.info("协议: HTTP")
+    
     logger.info(f"检测间隔: {AGENT_CONFIG.get('scrape_interval')} 秒")
     logger.info(f"目标数量: {len(AGENT_CONFIG.get('targets', []))}")
-    if AGENT_CONFIG.get('server_url'):
+    
+    if needs_server and AGENT_CONFIG.get('server_url'):
         server_url = AGENT_CONFIG.get('server_url')
-        if enable_https and server_url.startswith('http://'):
+        if AGENT_CONFIG.get('enable_https') and server_url.startswith('http://'):
             server_url = server_url.replace('http://', 'https://')
         logger.info(f"Server URL: {server_url}")
         logger.info(f"Server SSL 验证: {AGENT_CONFIG.get('verify_ssl', True)}")
         logger.info(f"目标同步间隔: {AGENT_CONFIG.get('sync_interval')} 秒")
-    logger.info("=" * 60)
-    logger.info("API 接口:")
-    logger.info("  - GET /health          - 健康检查")
-    logger.info("  - GET /info             - Agent 信息")
-    logger.info("  - GET /metrics          - Prometheus 格式指标")
-    logger.info("  - GET /api/v1/metrics   - JSON 格式指标")
+        logger.info(f"心跳间隔: {AGENT_CONFIG.get('heartbeat_interval', DEFAULT_CONFIG['heartbeat_interval'])} 秒")
+        logger.info(f"推送间隔: {AGENT_CONFIG.get('push_interval', DEFAULT_CONFIG['push_interval'])} 秒")
+    elif needs_server and not AGENT_CONFIG.get('server_url'):
+        logger.warning("未配置 SERVER_URL，推送/双模式将无法工作！")
+        logger.warning("请设置 SERVER_URL 环境变量指向 Server 地址")
+    
     logger.info("=" * 60)
     
-    # 启动定时检测线程
-    scrape_thread = threading.Thread(target=_scrape_loop, daemon=True)
-    scrape_thread.start()
+    if AGENT_MODE == 'push':
+        logger.info("推送模式 API:")
+        logger.info("  - POST → Server /api/v1/agents/<id>/metrics  推送指标")
+        logger.info("  - POST → Server /api/v1/agents/<id>/heartbeat 发送心跳")
+        logger.info("  - GET  ← Server /api/v1/agents/targets        拉取目标")
+        logger.info("=" * 60)
+        
+        # 启动推送模式主循环（不启动 Flask 服务）
+        push_thread = threading.Thread(target=_push_loop, daemon=True)
+        push_thread.start()
+        
+        # 推送模式下不需要启动 HTTP 服务，但保持进程运行
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            logger.info("Agent 正在停止...")
+    
+    elif AGENT_MODE == 'pull':
+        logger.info("拉取模式 API:")
+        logger.info("  - GET /health          - 健康检查")
+        logger.info("  - GET /info            - Agent 信息")
+        logger.info("  - GET /metrics         - Prometheus 格式指标")
+        logger.info("  - GET /api/v1/metrics  - JSON 格式指标")
+        logger.info("  - GET /api/v1/targets  - 目标列表")
+        logger.info("=" * 60)
+        
+        # 启动拉取模式定时检测线程
+        scrape_thread = threading.Thread(target=_scrape_loop, daemon=True)
+        scrape_thread.start()
+        
+        # 启动 HTTP/HTTPS 服务
+        _start_http_server()
+    
+    elif AGENT_MODE == 'dual':
+        logger.info("双模式 API:")
+        logger.info("  [推送] POST → Server /api/v1/agents/<id>/metrics  推送指标")
+        logger.info("  [推送] POST → Server /api/v1/agents/<id>/heartbeat 发送心跳")
+        logger.info("  [推送] GET  ← Server /api/v1/agents/targets        拉取目标")
+        logger.info("  [拉取] GET /health          - 健康检查")
+        logger.info("  [拉取] GET /info            - Agent 信息")
+        logger.info("  [拉取] GET /metrics         - Prometheus 格式指标")
+        logger.info("  [拉取] GET /api/v1/metrics  - JSON 格式指标")
+        logger.info("  [拉取] GET /api/v1/targets  - 目标列表")
+        logger.info("=" * 60)
+        
+        # 启动推送模式主循环（在后台线程中运行）
+        push_thread = threading.Thread(target=_push_loop, daemon=True)
+        push_thread.start()
+        
+        # 启动 HTTP/HTTPS 服务（主线程）
+        _start_http_server()
+
+
+def _start_http_server():
+    """启动 HTTP/HTTPS 服务（pull/dual 模式使用）"""
+    listen_host = AGENT_CONFIG.get('listen_host', DEFAULT_CONFIG['listen_host'])
+    listen_port = AGENT_CONFIG.get('listen_port', DEFAULT_CONFIG['listen_port'])
+    enable_https = AGENT_CONFIG.get('enable_https', False)
     
     # 根据是否启用 HTTPS 配置 SSL
     ssl_context = None

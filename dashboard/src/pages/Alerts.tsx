@@ -10,9 +10,11 @@ import {
   ChevronUp,
   Shield,
   Server,
-  User
+  User,
+  Key,
+  AlertOctagon
 } from 'lucide-react';
-import { Alert, AlertStats } from '../types/alert';
+import { Alert } from '../types/alert';
 import { 
   fetchAlerts, 
   calculateAlertStats, 
@@ -20,6 +22,35 @@ import {
   formatTimestamp,
   getTimeSince
 } from '../utils/alerts';
+
+const CREDENTIAL_API_BASE = '/api/agent/api/v1/credentials';
+
+interface Credential {
+  id: string;
+  name: string;
+  type: string;
+  type_label: string;
+  expiry_date: string;
+  owner: string;
+  owner_email: string;
+  env: string;
+  service_name: string;
+  remark: string;
+  enabled: boolean;
+  notify_days: number;
+  status: string;
+  days_left: number | null;
+  level: string;
+}
+
+interface CredentialAlertStats {
+  total: number;
+  expired: number;
+  critical: number;
+  warning: number;
+  normal: number;
+  unknown: number;
+}
 
 const STATE_CONFIG = {
   firing: { 
@@ -50,7 +81,6 @@ const STATE_CONFIG = {
 
 export default function Alerts() {
   const [alerts, setAlerts] = useState<Alert[]>([]);
-  const [stats, setStats] = useState<AlertStats | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [expandedAlerts, setExpandedAlerts] = useState<Set<string>>(new Set());
@@ -59,6 +89,8 @@ export default function Alerts() {
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null);
   const [isAutoRefresh, setIsAutoRefresh] = useState(true);
   const [newAlertIds, setNewAlertIds] = useState<Set<string>>(new Set());
+  const [credAlerts, setCredAlerts] = useState<Credential[]>([]);
+  const [credStats, setCredStats] = useState<CredentialAlertStats | null>(null);
 
   const REFRESH_INTERVAL = 10000; // 10秒刷新
 
@@ -84,7 +116,6 @@ export default function Alerts() {
       }
       
       setAlerts(alertData);
-      setStats(calculateAlertStats(alertData));
       setLastUpdate(new Date());
     } catch (err) {
       setError('获取告警数据失败，请检查网络连接');
@@ -94,12 +125,34 @@ export default function Alerts() {
     }
   };
 
+  const loadCredentialAlerts = async () => {
+    try {
+      const res = await fetch(CREDENTIAL_API_BASE);
+      if (res.ok) {
+        const json = await res.json();
+        if (json.status === 'success') {
+          const allCreds: Credential[] = json.credentials || [];
+          // 只保留已过期、高危、预警的凭证
+          const alertCreds = allCreds.filter(
+            c => c.status === 'expired' || c.status === 'critical' || c.status === 'warning'
+          );
+          setCredAlerts(alertCreds);
+          setCredStats(json.stats || null);
+        }
+      }
+    } catch {
+      // 凭证告警加载失败不影响主流程
+    }
+  };
+
   useEffect(() => {
     loadAlerts();
+    loadCredentialAlerts();
     if (!isAutoRefresh) return;
     
     const interval = setInterval(() => loadAlerts(), REFRESH_INTERVAL);
-    return () => clearInterval(interval);
+    const credInterval = setInterval(() => loadCredentialAlerts(), REFRESH_INTERVAL);
+    return () => { clearInterval(interval); clearInterval(credInterval); };
   }, [isAutoRefresh]);
 
   const toggleAutoRefresh = () => {
@@ -120,10 +173,15 @@ export default function Alerts() {
   };
 
   const filteredAlerts = alerts.filter(alert => {
+    // 凭证类告警在下方专用区域展示，主列表中不再重复
+    if (alert.labels.alert_type === 'credential') return false;
     if (stateFilter && alert.state !== stateFilter) return false;
     if (severityFilter && alert.labels.severity !== severityFilter) return false;
     return true;
   });
+
+  // 统计基于过滤后的列表（不含凭证告警，凭证有独立统计区）
+  const stats = calculateAlertStats(filteredAlerts);
 
   const getAlertKey = (alert: Alert) => {
     return `${alert.labels.alertname}-${alert.labels.hostname || ''}-${alert.labels.port || ''}`;
@@ -196,7 +254,7 @@ export default function Alerts() {
       </div>
 
       {/* 统计卡片 */}
-      {stats && (
+      {(
         <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
           <StatCard
             title="告警总数"
@@ -226,6 +284,46 @@ export default function Alerts() {
             color="text-green-600"
             bgColor="bg-green-50"
           />
+        </div>
+      )}
+
+      {/* 凭证告警统计卡片 */}
+      {credStats && (credStats.expired + credStats.critical + credStats.warning > 0) && (
+        <div>
+          <div className="flex items-center space-x-2 mb-3">
+            <Key className="h-5 w-5 text-indigo-600" />
+            <h2 className="text-lg font-bold text-gray-900">凭证告警</h2>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
+            <StatCard
+              title="凭证告警总数"
+              value={credStats.expired + credStats.critical + credStats.warning}
+              icon={Key}
+              color="text-indigo-600"
+              bgColor="bg-indigo-50"
+            />
+            <StatCard
+              title="已过期"
+              value={credStats.expired}
+              icon={XCircle}
+              color="text-gray-600"
+              bgColor="bg-gray-50"
+            />
+            <StatCard
+              title="高危 (<7天)"
+              value={credStats.critical}
+              icon={AlertOctagon}
+              color="text-red-600"
+              bgColor="bg-red-50"
+            />
+            <StatCard
+              title="预警 (<30天)"
+              value={credStats.warning}
+              icon={AlertTriangle}
+              color="text-amber-600"
+              bgColor="bg-amber-50"
+            />
+          </div>
         </div>
       )}
 
@@ -284,11 +382,11 @@ export default function Alerts() {
 
       {/* 告警列表 */}
       <div className="space-y-4">
-        {filteredAlerts.length === 0 ? (
+        {filteredAlerts.length === 0 && credAlerts.length === 0 ? (
           <div className="card text-center py-12">
             <CheckCircle className="h-16 w-16 text-green-500 mx-auto mb-4" />
             <h2 className="text-xl font-semibold text-gray-900 mb-2">暂无告警</h2>
-            <p className="text-gray-500">所有证书状态正常，没有活跃的告警</p>
+            <p className="text-gray-500">所有证书和凭证状态正常，没有活跃的告警</p>
           </div>
         ) : (
           filteredAlerts.map((alert, index) => {
@@ -454,6 +552,159 @@ export default function Alerts() {
               </div>
             );
           })
+        )}
+
+        {/* 凭证告警列表 */}
+        {credAlerts.length > 0 && (
+          <>
+            <div className="flex items-center space-x-2 pt-4">
+              <Key className="h-5 w-5 text-indigo-600" />
+              <h2 className="text-lg font-bold text-gray-900">凭证过期告警</h2>
+              <span className="bg-indigo-100 text-indigo-800 text-xs font-bold px-2 py-1 rounded-full">
+                {credAlerts.length}
+              </span>
+            </div>
+            {credAlerts
+              .sort((a, b) => (a.days_left ?? 9999) - (b.days_left ?? 9999))
+              .map(cred => {
+                const isCritical = cred.status === 'expired' || cred.status === 'critical';
+                const bgColor = isCritical ? 'bg-red-50' : 'bg-amber-50';
+                const borderColor = isCritical ? 'border-red-200' : 'border-amber-200';
+                const iconColor = isCritical ? 'text-red-500' : 'text-amber-500';
+                const textColor = isCritical ? 'text-red-800' : 'text-amber-800';
+                const severityLabel = cred.status === 'expired' ? '已过期' : cred.status === 'critical' ? '高危' : '预警';
+                const severityColor = cred.status === 'expired' ? '#6b7280' : cred.status === 'critical' ? '#ef4444' : '#f59e0b';
+                const CredIcon = isCritical ? AlertOctagon : AlertTriangle;
+                const alertKey = `cred-${cred.id}`;
+                const isExpanded = expandedAlerts.has(alertKey);
+                const typeLabels: Record<string, string> = { cert: 'SSL证书', key: '密钥', auth: '授权', password: '口令' };
+
+                return (
+                  <div
+                    key={cred.id}
+                    className={`card ${bgColor} ${borderColor} border-2 transition-all`}
+                  >
+                    <div
+                      className="flex items-start justify-between cursor-pointer"
+                      onClick={() => toggleAlert(alertKey)}
+                    >
+                      <div className="flex items-start space-x-4 flex-1">
+                        <CredIcon className={`h-6 w-6 ${iconColor} mt-1`} />
+                        <div className="flex-1">
+                          <div className="flex items-center space-x-2 mb-2">
+                            <h3 className="text-lg font-semibold text-gray-900">
+                              {cred.name}
+                            </h3>
+                            <span
+                              className="px-2 py-1 rounded text-xs font-bold text-white"
+                              style={{ backgroundColor: severityColor }}
+                            >
+                              {severityLabel}
+                            </span>
+                            <span className="px-2 py-1 rounded text-xs font-bold bg-indigo-100 text-indigo-800">
+                              {typeLabels[cred.type] || cred.type_label}
+                            </span>
+                          </div>
+                          <p className="text-gray-700 mb-3">
+                            {cred.status === 'expired'
+                              ? `该凭证已于 ${cred.expiry_date} 过期`
+                              : `该凭证将于 ${cred.expiry_date} 过期，剩余 ${cred.days_left} 天`}
+                          </p>
+                          <div className="flex flex-wrap gap-4 text-sm">
+                            {cred.service_name && (
+                              <div className="flex items-center space-x-1 text-gray-600">
+                                <Server className="h-4 w-4" />
+                                <span>{cred.service_name}</span>
+                              </div>
+                            )}
+                            {cred.env && (
+                              <div className="flex items-center space-x-1 text-gray-600">
+                                <Shield className="h-4 w-4" />
+                                <span>{cred.env}</span>
+                              </div>
+                            )}
+                            {cred.owner && (
+                              <div className="flex items-center space-x-1 text-gray-600">
+                                <User className="h-4 w-4" />
+                                <span>{cred.owner}</span>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                      <div className="flex items-center space-x-4 ml-4">
+                        <div className="text-right">
+                          <p className="text-sm text-gray-600">到期日期</p>
+                          <p className={`font-bold ${textColor}`}>
+                            {cred.days_left !== null && cred.days_left < 0
+                              ? `已过期 ${Math.abs(cred.days_left)} 天`
+                              : `剩余 ${cred.days_left} 天`}
+                          </p>
+                          <p className="text-xs text-gray-500">{cred.expiry_date}</p>
+                        </div>
+                        {isExpanded ? (
+                          <ChevronUp className="h-5 w-5 text-gray-400" />
+                        ) : (
+                          <ChevronDown className="h-5 w-5 text-gray-400" />
+                        )}
+                      </div>
+                    </div>
+
+                    {isExpanded && (
+                      <div className="mt-6 pt-6 border-t border-gray-200">
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                          <div>
+                            <h4 className="text-sm font-medium text-gray-700 mb-3 flex items-center space-x-2">
+                              <AlertTriangle className="h-4 w-4" />
+                              <span>凭证详情</span>
+                            </h4>
+                            <div className="space-y-3 text-sm">
+                              <div>
+                                <p className="text-gray-500 mb-1">凭证名称：</p>
+                                <p className="text-gray-900 bg-white p-3 rounded">{cred.name}</p>
+                              </div>
+                              <div>
+                                <p className="text-gray-500 mb-1">凭证类型：</p>
+                                <p className="text-gray-900">{typeLabels[cred.type] || cred.type_label}</p>
+                              </div>
+                              {cred.remark && (
+                                <div>
+                                  <p className="text-gray-500 mb-1">备注：</p>
+                                  <p className="text-gray-900 bg-white p-3 rounded">{cred.remark}</p>
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                          <div>
+                            <h4 className="text-sm font-medium text-gray-700 mb-3 flex items-center space-x-2">
+                              <Bell className="h-4 w-4" />
+                              <span>关联信息</span>
+                            </h4>
+                            <div className="bg-white rounded-lg p-4 space-y-2">
+                              {[
+                                ['到期日期', cred.expiry_date],
+                                ['剩余天数', cred.days_left !== null ? (cred.days_left < 0 ? `已过期 ${Math.abs(cred.days_left)} 天` : `${cred.days_left} 天`) : '-'],
+                                ['告警级别', severityLabel],
+                                ['负责人', cred.owner],
+                                ['负责人邮箱', cred.owner_email],
+                                ['环境', cred.env],
+                                ['关联服务', cred.service_name],
+                                ['提前告警天数', `${cred.notify_days} 天`],
+                              ].filter(([, v]) => v && v !== '-').map(([key, value]) => (
+                                <div key={key as string} className="flex items-center justify-between text-sm">
+                                  <span className="text-gray-500">{key}:</span>
+                                  <span className="text-gray-900 font-medium">{value}</span>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+          </>
         )}
       </div>
     </div>

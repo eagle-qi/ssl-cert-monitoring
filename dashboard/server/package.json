@@ -8,6 +8,8 @@
   "dependencies": {
     "express": "^4.18.2",
     "multer": "^1.4.5-lts.1",
+    "node-cron": "^3.0.3",
+    "nodemailer": "^6.9.7",
     "svg-captcha": "^1.4.0",
     "xlsx": "^0.18.5"
   }

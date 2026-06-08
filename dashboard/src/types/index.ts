@@ -25,7 +25,7 @@ export interface SSLCertData extends SSLCertMetric {
   not_after_date: string;
   not_before_date: string;
   days_until_expiry: number;
-  status: 'valid' | 'warning' | 'critical' | 'expired';
+  status: 'valid' | 'warning' | 'critical' | 'expired' | 'unreachable';
   status_color: string;
 }
 
@@ -35,6 +35,7 @@ export interface DashboardStats {
   warning: number;
   critical: number;
   expired: number;
+  unreachable: number;
   average_days_left: number;
 }
 

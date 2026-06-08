@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Search, Filter, RefreshCw, CheckCircle, AlertTriangle, XCircle, ChevronDown, ChevronUp, Shield, ShieldOff, Download } from 'lucide-react';
+import { Search, Filter, RefreshCw, CheckCircle, AlertTriangle, XCircle, ChevronDown, ChevronUp, Shield, ShieldOff, Download, WifiOff } from 'lucide-react';
 import { SSLCertData } from '../types';
 import { fetchMetrics, filterCertificates, getUniqueValues } from '../utils/metrics';
 import * as XLSX from 'xlsx';
@@ -9,14 +9,16 @@ const STATUS_CONFIG = {
   warning: { label: '即将过期', color: '#f59e0b', bgColor: 'bg-amber-100', textColor: 'text-amber-800' },
   critical: { label: '紧急', color: '#ef4444', bgColor: 'bg-red-100', textColor: 'text-red-800' },
   expired: { label: '已过期', color: '#6b7280', bgColor: 'bg-gray-100', textColor: 'text-gray-800' },
+  unreachable: { label: '无法连接', color: '#6b7280', bgColor: 'bg-gray-100', textColor: 'text-gray-600' },
 };
 
-// 状态排序优先级：紧急 > 即将过期 > 已过期 > 正常
+// 状态排序优先级：紧急 > 即将过期 > 已过期 > 无法连接 > 正常
 const STATUS_PRIORITY: Record<string, number> = {
   critical: 0,
   warning: 1,
   expired: 2,
-  valid: 3,
+  unreachable: 3,
+  valid: 4,
 };
 
 const EXPORT_HEADERS = ['服务名称', '主机', '端口', '团队', '环境', '状态', '剩余天数', '到期日期', '生效日期', '主题CN', '颁发者CN', '颁发者组织', 'WebTrust认证', 'SAN数量', '序列号'];
@@ -133,6 +135,8 @@ export default function Certificates() {
       case 'critical':
       case 'expired':
         return <XCircle className="h-4 w-4 text-red-500" />;
+      case 'unreachable':
+        return <WifiOff className="h-4 w-4 text-gray-400" />;
       default:
         return null;
     }
@@ -289,6 +293,7 @@ export default function Certificates() {
                 <option value="warning">即将过期</option>
                 <option value="critical">紧急</option>
                 <option value="expired">已过期</option>
+                <option value="unreachable">无法连接</option>
               </select>
             </div>
           </div>

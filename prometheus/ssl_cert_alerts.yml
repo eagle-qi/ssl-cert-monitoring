@@ -77,3 +77,52 @@ groups:
       #     description: "Agent {{ $labels.hostname }} ({{ $labels.ip }}) 已离线或无法访问，请检查 Agent 服务状态"
       #     owner: "{{ $labels.owner }}"
 
+  # ========== 凭证管理告警规则 ==========
+  - name: credential_alerts
+    interval: 60s
+    rules:
+      # 凭证已过期
+      - alert: CredentialExpired
+        expr: credential_days_left <= 0
+        for: 1m
+        labels:
+          severity: critical
+          alert_type: credential
+        annotations:
+          summary: "凭证已过期 - {{ $labels.credential_name }}"
+          description: "凭证 {{ $labels.credential_name }} ({{ $labels.credential_type }}) 已过期! 负责人: {{ $labels.owner }}"
+          owner: "{{ $labels.owner }}"
+          owner_email: "{{ $labels.owner_email }}"
+          service: "{{ $labels.service_name }}"
+          env: "{{ $labels.env }}"
+
+      # 凭证即将过期 - 高危 (≤7天)
+      - alert: CredentialExpiringCritical
+        expr: credential_days_left > 0 and credential_days_left < 7
+        for: 5m
+        labels:
+          severity: critical
+          alert_type: credential
+        annotations:
+          summary: "凭证即将过期(高危) - {{ $labels.credential_name }}"
+          description: "凭证 {{ $labels.credential_name }} ({{ $labels.credential_type }}) 将在 {{ $value | printf \"%.1f\" }} 天后过期! 请立即处理! 负责人: {{ $labels.owner }}"
+          owner: "{{ $labels.owner }}"
+          owner_email: "{{ $labels.owner_email }}"
+          service: "{{ $labels.service_name }}"
+          env: "{{ $labels.env }}"
+
+      # 凭证即将过期 - 预警 (≤30天)
+      - alert: CredentialExpiringWarning
+        expr: credential_days_left >= 7 and credential_days_left < 30
+        for: 10m
+        labels:
+          severity: warning
+          alert_type: credential
+        annotations:
+          summary: "凭证即将过期(预警) - {{ $labels.credential_name }}"
+          description: "凭证 {{ $labels.credential_name }} ({{ $labels.credential_type }}) 将在 {{ $value | printf \"%.1f\" }} 天后过期. 负责人: {{ $labels.owner }}"
+          owner: "{{ $labels.owner }}"
+          owner_email: "{{ $labels.owner_email }}"
+          service: "{{ $labels.service_name }}"
+          env: "{{ $labels.env }}"
+

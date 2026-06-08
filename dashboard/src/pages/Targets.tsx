@@ -73,10 +73,10 @@ export default function Targets() {
       const serverRes = await fetch(API_BASE);
       const serverData = await serverRes.json();
       
-      // 只获取手动管理的目标（不是 Agent 管理的）
+      // 只获取非 Agent 管理的目标（agent_id 为空的普通目标）
       const serverTargets: Target[] = serverData.status === 'success' || serverData.success 
         ? (serverData.targets || serverData.data?.targets || []).filter(
-            (t: any) => !t.is_agent_target && !t.synced_from_agent
+            (t: any) => !t.agent_id
           )
         : [];
       

@@ -51,6 +51,7 @@ def build_feishu_message(alert_data):
     alert_name = labels.get('alertname', 'Unknown Alert')
     status = alert_data.get('status', 'unknown')
     severity = labels.get('severity', 'unknown')
+    alert_type = labels.get('alert_type', '')
     instance = labels.get('instance', 'N/A')
     job = labels.get('job', 'N/A')
     
@@ -83,34 +84,62 @@ def build_feishu_message(alert_data):
         'info': 'ℹ️'
     }.get(severity.lower(), '📢')
     
-    # 消息头部
-    msg_parts.append(f"{status_icon} **{status_text}** {severity_icon}")
-    msg_parts.append(f"━━━━━━━━━━━━━━━━━━━━")
-    
-    # 告警详情
-    if summary:
-        msg_parts.append(f"**告警名称**: {summary}")
-    else:
-        msg_parts.append(f"**告警名称**: {alert_name}")
-    
-    msg_parts.append(f"**严重程度**: {severity.upper()}")
-    msg_parts.append(f"**触发时间**: {starts_at}")
-    
-    if instance != 'N/A':
-        msg_parts.append(f"**实例**: {instance}")
-    
-    if job != 'N/A':
-        msg_parts.append(f"**监控任务**: {job}")
-    
-    # 告警描述
-    if message:
+    # 根据告警类型构建不同消息格式
+    if alert_type == 'credential':
+        # ========== 凭证管理告警 ==========
+        type_labels = {'cert': 'SSL证书', 'key': '密钥', 'auth': '授权', 'password': '口令/密码'}
+        credential_name = labels.get('credential_name', '未知')
+        credential_type = type_labels.get(labels.get('credential_type', ''), labels.get('credential_type', '未知'))
+        service_name = labels.get('service_name', '未知')
+        owner = labels.get('owner', '未知')
+        env = labels.get('env', '未知')
+        
+        msg_parts.append(f"{status_icon} **{status_text}** {severity_icon}")
         msg_parts.append(f"━━━━━━━━━━━━━━━━━━━━")
-        msg_parts.append(f"**告警内容**:")
-        msg_parts.append(f"{message}")
-    
-    # 结束标记
-    msg_parts.append(f"━━━━━━━━━━━━━━━━━━━━")
-    msg_parts.append(f"_< 这是一条由 SSL 证书监控系统自动发送的告警 >_")
+        msg_parts.append(f"**告警名称**: {summary or alert_name}")
+        msg_parts.append(f"**严重程度**: {severity.upper()}")
+        msg_parts.append(f"**触发时间**: {starts_at}")
+        msg_parts.append(f"**凭证名称**: {credential_name}")
+        msg_parts.append(f"**凭证类型**: {credential_type}")
+        msg_parts.append(f"**所属服务**: {service_name}")
+        msg_parts.append(f"**环境**: {env}")
+        msg_parts.append(f"**负责人**: {owner}")
+        
+        if message:
+            msg_parts.append(f"━━━━━━━━━━━━━━━━━━━━")
+            msg_parts.append(f"**告警内容**:")
+            msg_parts.append(f"{message}")
+        
+        msg_parts.append(f"━━━━━━━━━━━━━━━━━━━━")
+        msg_parts.append(f"_< 这是一条由凭证管理系统自动发送的告警 >_")
+    else:
+        # ========== SSL 证书告警（原有逻辑） ==========
+        msg_parts.append(f"{status_icon} **{status_text}** {severity_icon}")
+        msg_parts.append(f"━━━━━━━━━━━━━━━━━━━━")
+        
+        if summary:
+            msg_parts.append(f"**告警名称**: {summary}")
+        else:
+            msg_parts.append(f"**告警名称**: {alert_name}")
+        
+        msg_parts.append(f"**严重程度**: {severity.upper()}")
+        msg_parts.append(f"**触发时间**: {starts_at}")
+        
+        if instance != 'N/A':
+            msg_parts.append(f"**实例**: {instance}")
+        
+        if job != 'N/A':
+            msg_parts.append(f"**监控任务**: {job}")
+        
+        # 告警描述
+        if message:
+            msg_parts.append(f"━━━━━━━━━━━━━━━━━━━━")
+            msg_parts.append(f"**告警内容**:")
+            msg_parts.append(f"{message}")
+        
+        # 结束标记
+        msg_parts.append(f"━━━━━━━━━━━━━━━━━━━━")
+        msg_parts.append(f"_< 这是一条由 SSL 证书监控系统自动发送的告警 >_")
     
     return '\n'.join(msg_parts)
 

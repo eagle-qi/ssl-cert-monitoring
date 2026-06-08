@@ -1,0 +1,24 @@
+- generic [ref=e4]:
+  - generic [ref=e5]:
+    - img [ref=e7]
+    - heading "SSL证书监控平台" [level=1] [ref=e9]
+    - paragraph [ref=e10]: 请登录以继续
+  - generic [ref=e11]:
+    - generic [ref=e12]:
+      - generic [ref=e13]: 用户名
+      - textbox "用户名" [ref=e14]:
+        - /placeholder: 请输入用户名
+    - generic [ref=e15]:
+      - generic [ref=e16]: 密码
+      - textbox "密码" [ref=e17]:
+        - /placeholder: 请输入密码
+    - generic [ref=e18]:
+      - generic [ref=e19]: 验证码
+      - generic [ref=e20]:
+        - textbox "验证码" [ref=e21]:
+          - /placeholder: 请输入验证码
+        - button "刷新验证码" [ref=e22] [cursor=pointer]:
+          - img [ref=e23]
+    - button "登录" [ref=e28] [cursor=pointer]:
+      - generic [ref=e29]: 登录
+  - paragraph [ref=e31]: 账号信息请查看环境变量配置

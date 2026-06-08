@@ -3,13 +3,16 @@
 SSL Certificate Monitoring - Server
 服务端：支持两种模式
 1. 直接监控模式：Server 直接检测可访问的目标
-2. Agent 拉取模式：Server 从内网 Agent 拉取证书数据
+2. Agent 推送模式：Agent 主动推送指标数据和心跳到 Server（推荐）
+3. Agent 拉取模式（兼容）：Server 从内网 Agent 拉取证书数据
 
 功能：
 1. 从配置文件读取目标列表和 Agent 列表
 2. 直接检测可访问的目标（公网/内网可直连）
-3. 从各 Agent 拉取内网目标的指标数据
-4. 聚合所有指标数据，提供 Prometheus 格式查询接口
+3. 接收 Agent 主动推送的指标数据（推送模式）
+4. 从各 Agent 拉取内网目标的指标数据（拉取模式兼容）
+5. 通过心跳判断 Agent 在线状态
+6. 聚合所有指标数据，提供 Prometheus 格式查询接口
 """
 
 from flask import Flask, request, jsonify
@@ -20,9 +23,15 @@ import logging
 import threading
 import requests
 import ssl
+from urllib.parse import urlparse
 import socket
-from datetime import datetime
+import hashlib
+import uuid
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, wait
+
+# 导入数据库模块
+import db
 
 app = Flask(__name__)
 
@@ -40,10 +49,10 @@ SSL_CERT_FILE = os.getenv('SSL_CERT_FILE', '/app/certs/server.crt')
 SSL_KEY_FILE = os.getenv('SSL_KEY_FILE', '/app/certs/server.key')
 VERIFY_SSL = os.getenv('SERVER_VERIFY_SSL', 'true').lower() == 'true'  # Server 端请求 Agent 时是否验证 SSL
 
-# Agent 配置列表
-AGENT_TARGETS = []  # [{'agent_id': '...', 'host': '...', 'port': 8091, 'name': '...'}]
+# Agent 心跳超时
+HEARTBEAT_TIMEOUT = int(os.getenv('HEARTBEAT_TIMEOUT', '300'))  # 心跳超时时间（秒）
 
-# 指标存储
+# 指标缓存（内存中保留最新指标，用于 Prometheus /metrics 端点快速响应）
 METRICS_BUFFER = []
 METRICS_LOCK = threading.Lock()
 MAX_METRICS_BUFFER = 10000
@@ -52,130 +61,118 @@ MAX_METRICS_BUFFER = 10000
 SCRAPE_INTERVAL = 60  # 拉取间隔（秒）
 DIRECT_SCRAPE_INTERVAL = 60  # 直接监控间隔（秒）
 
-# 目标配置存储
-SERVER_TARGETS = []  # [{'id': '...', 'url': '...', 'agent_id': None, ...}]
-TARGETS_LOCK = threading.Lock()
-TARGETS_LAST_SYNC = None  # 上次同步时间
+# 目标/凭证文件路径（仅用于兼容性生成）
 TARGETS_CONFIG_PATH = os.getenv('TARGETS_CONFIG_PATH', '/app/data/agent_targets.json')
 UNIFIED_TARGETS_PATH = os.getenv('UNIFIED_TARGETS_PATH', '/app/data/ssl_targets.json')
-AGENT_TARGETS_PATH = os.getenv('AGENT_TARGETS_PATH', '/app/agent_data/targets.json')  # Agent 本地目标文件
+AGENT_TARGETS_PATH = os.getenv('AGENT_TARGETS_PATH', '/app/agent_data/targets.json')
+PROMETHEUS_TARGETS_PATH = os.getenv('PROMETHEUS_TARGETS_PATH', '/app/data/prometheus_targets.json')
+
+# 凭证过期告警阈值
+CREDENTIAL_WARN_DAYS = 30   # 小于30天预警
+CREDENTIAL_CRIT_DAYS = 7    # 小于7天高危
+
+# 凭证告警通知
+CREDENTIAL_ALERT_WEBHOOK = os.getenv('CREDENTIAL_ALERT_WEBHOOK', '')  # 飞书 Webhook URL
+CREDENTIAL_ALERT_EMAILS = os.getenv('CREDENTIAL_ALERT_EMAILS', '')    # 逗号分隔的告警邮箱
+CREDENTIAL_ALERT_CHECK_INTERVAL = int(os.getenv('CREDENTIAL_ALERT_CHECK_INTERVAL', '3600'))  # 检查间隔（秒）
 EXPORTER_RELOAD_URL = os.getenv('EXPORTER_RELOAD_URL', 'http://localhost:9116/reload')
 
 
+def _parse_target_hostname_port(target_url):
+    """从目标 URL 解析 hostname:port，用于清理关联的指标数据"""
+    if not target_url:
+        return None, None
+    parsed = urlparse(target_url)
+    hostname = parsed.hostname or target_url
+    if parsed.port:
+        port = str(parsed.port)
+    elif parsed.scheme == 'https':
+        port = '443'
+    elif parsed.scheme == 'http':
+        port = '80'
+    else:
+        port = '443'  # 默认 HTTPS
+    return hostname, port
+
+
+def _clean_metrics_for_target(target):
+    """删除与目标关联的 METRICS_BUFFER 和数据库指标数据"""
+    target_url = target.get('url', '')
+    hostname, port = _parse_target_hostname_port(target_url)
+    if not hostname:
+        return
+    
+    # 构造 hostname 变体列表：同时匹配 www.xxx 和 xxx
+    hostname_variants = {hostname}
+    if hostname.startswith('www.'):
+        hostname_variants.add(hostname[4:])  # www.google.com → google.com
+    else:
+        hostname_variants.add('www.' + hostname)  # google.com → www.google.com
+    
+    # 1. 从内存 METRICS_BUFFER 中清理（匹配所有 hostname 变体）
+    with METRICS_LOCK:
+        before = len(METRICS_BUFFER)
+        METRICS_BUFFER[:] = [
+            m for m in METRICS_BUFFER
+            if not (m.get('hostname') in hostname_variants and str(m.get('port', '')) == port)
+        ]
+        removed = before - len(METRICS_BUFFER)
+    
+    # 2. 从数据库 metrics 表中清理（所有 hostname 变体）
+    db_deleted = 0
+    for hn in hostname_variants:
+        db_deleted += db.delete_metrics_by_hostname_port(hn, port)
+    
+    if removed > 0 or db_deleted > 0:
+        logger.info(f"清理目标 {target_url} 的指标数据: 内存 {removed} 条, 数据库 {db_deleted} 条")
+
+
 def load_config():
-    """加载配置文件"""
-    try:
-        if os.path.exists(CONFIG_PATH):
-            with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        return {"agents": [], "settings": {"scrape_interval": 60}}
-    except Exception as e:
-        logger.error(f"加载配置失败: {e}")
-        return {"agents": [], "settings": {"scrape_interval": 60}}
+    """加载配置（从数据库读取）"""
+    agents = db.get_agents()
+    settings_raw = db.get_all_settings()
+    settings = {}
+    for k, v in settings_raw.items():
+        # 尝试解析 JSON 值
+        try:
+            settings[k] = json.loads(v)
+        except (json.JSONDecodeError, TypeError):
+            try:
+                settings[k] = int(v)
+            except (ValueError, TypeError):
+                settings[k] = v
+    return {"agents": agents, "settings": settings}
 
 
 def save_config(config):
-    """保存配置文件"""
-    try:
-        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
-        with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
-            json.dump(config, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.error(f"保存配置失败: {e}")
+    """保存配置（写入数据库）"""
+    agents = config.get('agents', [])
+    for agent in agents:
+        db.upsert_agent(agent)
+    settings = config.get('settings', {})
+    for k, v in settings.items():
+        if isinstance(v, (dict, list)):
+            db.set_setting(k, json.dumps(v, ensure_ascii=False))
+        else:
+            db.set_setting(k, str(v))
 
 
 def load_targets_config():
-    """加载目标配置文件 - 分别从不同文件读取"""
-    global SERVER_TARGETS
-    try:
-        # 加载直接监控目标（从 ssl_targets.json）
-        direct_targets = []
-        if os.path.exists(UNIFIED_TARGETS_PATH):
-            with open(UNIFIED_TARGETS_PATH, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                direct_targets = data.get('targets', [])
-        
-        # 加载 Agent 管理目标（从 agent/data/targets.json）
-        agent_targets = []
-        if os.path.exists(AGENT_TARGETS_PATH):
-            with open(AGENT_TARGETS_PATH, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                agent_targets = data.get('targets', [])
-        
-        # 从 agent_targets.json 加载（完整备份，包含所有目标）
-        all_targets = []
-        if os.path.exists(TARGETS_CONFIG_PATH):
-            with open(TARGETS_CONFIG_PATH, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                all_targets = data.get('targets', [])
-        
-        # 合并所有目标
-        SERVER_TARGETS = direct_targets + agent_targets
-        
-        # 如果 agent_targets.json 有更多目标，追加
-        for t in agent_targets:
-            if t not in SERVER_TARGETS:
-                SERVER_TARGETS.append(t)
-        
-        logger.info(f"加载目标配置: {len(direct_targets)} 个直接监控目标, {len(agent_targets)} 个 Agent 管理目标")
-        return SERVER_TARGETS
-    except Exception as e:
-        logger.error(f"加载目标配置失败: {e}")
-        return []
+    """加载目标配置（从数据库读取）"""
+    targets = db.get_targets()
+    logger.info(f"加载目标配置: {len(targets)} 个目标 (数据库)")
+    return targets
 
 
 def save_targets_config():
-    """保存目标配置文件 - 分别保存到不同文件"""
-    global SERVER_TARGETS
+    """保存目标配置（数据已通过 upsert 写入数据库，此处仅同步辅助文件）"""
     try:
-        os.makedirs(os.path.dirname(TARGETS_CONFIG_PATH), exist_ok=True)
-        os.makedirs(os.path.dirname(UNIFIED_TARGETS_PATH), exist_ok=True)
-        os.makedirs(os.path.dirname(AGENT_TARGETS_PATH), exist_ok=True)
-        
-        # 分离直接监控目标和 Agent 管理目标
-        direct_targets = [t for t in SERVER_TARGETS if not t.get('agent_id')]
-        agent_managed_targets = [t for t in SERVER_TARGETS if t.get('agent_id')]
-        
-        # 保存所有目标到 agent_targets.json（完整备份）
-        with open(TARGETS_CONFIG_PATH, 'w', encoding='utf-8') as f:
-            json.dump({'targets': SERVER_TARGETS}, f, ensure_ascii=False, indent=2)
-        
-        # 只将直接监控目标（无 agent_id）同步到 ssl_targets.json
-        sync_direct_targets_to_unified_config(direct_targets)
-        
-        # 将 Agent 管理目标写入到 agent/data/targets.json（供 Agent 读取）
-        with open(AGENT_TARGETS_PATH, 'w', encoding='utf-8') as f:
-            json.dump({'targets': agent_managed_targets}, f, ensure_ascii=False, indent=2)
-        
-        logger.info(f"保存目标配置: {len(direct_targets)} 个直接监控目标, {len(agent_managed_targets)} 个 Agent 管理目标")
-        logger.info(f"Agent 目标已同步到 {AGENT_TARGETS_PATH}")
+        # 生成 prometheus_targets.json 和 agent/data/targets.json
+        db.generate_prometheus_targets(PROMETHEUS_TARGETS_PATH)
+        db.generate_agent_targets(AGENT_TARGETS_PATH)
+        logger.info("已同步辅助目标文件")
     except Exception as e:
-        logger.error(f"保存目标配置失败: {e}")
-
-
-def sync_direct_targets_to_unified_config(direct_targets):
-    """只将直接监控目标（无 agent_id）同步到 ssl_targets.json"""
-    try:
-        # 读取现有统一配置（保留 settings 等其他字段）
-        unified_config = {'targets': []}
-        if os.path.exists(UNIFIED_TARGETS_PATH):
-            try:
-                with open(UNIFIED_TARGETS_PATH, 'r', encoding='utf-8') as f:
-                    unified_config = json.load(f)
-            except:
-                pass
-        
-        # 只更新直接监控目标（保留 Agent 管理目标在 ssl_targets.json 中的配置）
-        # 保留 settings 等其他字段
-        unified_config['targets'] = direct_targets
-        
-        # 保存
-        with open(UNIFIED_TARGETS_PATH, 'w', encoding='utf-8') as f:
-            json.dump(unified_config, f, ensure_ascii=False, indent=2)
-        
-        logger.info(f"同步 {len(direct_targets)} 个直接监控目标到 {UNIFIED_TARGETS_PATH}")
-    except Exception as e:
-        logger.error(f"同步直接监控目标到统一路径失败: {e}")
+        logger.error(f"同步辅助目标文件失败: {e}")
 
 
 def trigger_exporter_reload():
@@ -197,25 +194,203 @@ def trigger_exporter_reload():
 
 
 def load_metrics():
-    """加载历史指标数据"""
+    """加载指标数据（从数据库读取最近30分钟）"""
     try:
-        if os.path.exists(DATA_PATH):
-            with open(DATA_PATH, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        return {"metrics": [], "last_updated": None}
+        metrics = db.get_recent_metrics(minutes=30)
+        return {"metrics": metrics, "last_updated": datetime.now().isoformat()}
     except Exception as e:
         logger.error(f"加载指标数据失败: {e}")
         return {"metrics": [], "last_updated": None}
 
 
 def save_metrics(data):
-    """保存指标数据"""
+    """保存指标数据（已弃用，保留接口兼容）"""
+    pass
+
+
+def _save_metrics_async(metrics):
+    """异步保存指标数据到数据库"""
     try:
-        os.makedirs(os.path.dirname(DATA_PATH), exist_ok=True)
-        with open(DATA_PATH, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        db.insert_metrics(metrics)
     except Exception as e:
-        logger.error(f"保存指标数据失败: {e}")
+        logger.error(f"保存指标到数据库失败: {e}")
+
+
+# ========== 凭证管理 ==========
+
+def load_credentials_config():
+    """加载凭证配置（从数据库读取）"""
+    creds = db.get_credentials()
+    logger.info(f"加载凭证配置: {len(creds)} 条记录 (数据库)")
+    return creds
+
+
+def save_credentials_config():
+    """保存凭证配置（已弃用，数据已通过 upsert 写入数据库）"""
+    pass
+
+
+def compute_credential_status(expiry_date_str):
+    """计算凭证过期状态"""
+    if not expiry_date_str:
+        return {'status': 'unknown', 'days_left': None, 'level': 'info'}
+    try:
+        expiry = datetime.strptime(expiry_date_str[:10], '%Y-%m-%d')
+        now = datetime.now()
+        days_left = (expiry - now).days
+        if days_left < 0:
+            return {'status': 'expired', 'days_left': days_left, 'level': 'critical'}
+        elif days_left < CREDENTIAL_CRIT_DAYS:
+            return {'status': 'critical', 'days_left': days_left, 'level': 'critical'}
+        elif days_left < CREDENTIAL_WARN_DAYS:
+            return {'status': 'warning', 'days_left': days_left, 'level': 'warning'}
+        else:
+            return {'status': 'normal', 'days_left': days_left, 'level': 'info'}
+    except Exception:
+        return {'status': 'unknown', 'days_left': None, 'level': 'info'}
+
+
+def check_credential_expiry():
+    """定时检查凭证过期并发送告警"""
+    while True:
+        try:
+            time.sleep(CREDENTIAL_ALERT_CHECK_INTERVAL)
+            credentials = db.get_credentials(enabled_only=True)
+            if not credentials:
+                continue
+            
+            alerts = []
+            for cred in credentials:
+                if not cred.get('expiry_date'):
+                    continue
+                info = compute_credential_status(cred['expiry_date'])
+                if info['status'] in ('critical', 'expired'):
+                    alerts.append({
+                        'name': cred.get('name', ''),
+                        'type': cred.get('type', ''),
+                        'expiry_date': cred.get('expiry_date', ''),
+                        'days_left': info['days_left'],
+                        'level': 'critical',
+                        'owner': cred.get('owner', ''),
+                        'owner_email': cred.get('owner_email', ''),
+                    })
+                elif info['status'] == 'warning':
+                    alerts.append({
+                        'name': cred.get('name', ''),
+                        'type': cred.get('type', ''),
+                        'expiry_date': cred.get('expiry_date', ''),
+                        'days_left': info['days_left'],
+                        'level': 'warning',
+                        'owner': cred.get('owner', ''),
+                        'owner_email': cred.get('owner_email', ''),
+                    })
+            
+            if not alerts:
+                continue
+            
+            # 发送飞书告警
+            if CREDENTIAL_ALERT_WEBHOOK:
+                try:
+                    send_feishu_credential_alert(alerts)
+                except Exception as e:
+                    logger.error(f"发送凭证过期飞书告警失败: {e}")
+            
+            # 发送邮件告警
+            if CREDENTIAL_ALERT_EMAILS:
+                try:
+                    send_email_credential_alert(alerts)
+                except Exception as e:
+                    logger.error(f"发送凭证过期邮件告警失败: {e}")
+                    
+        except Exception as e:
+            logger.error(f"凭证过期检查异常: {e}")
+
+
+def send_feishu_credential_alert(alerts):
+    """发送凭证过期飞书告警"""
+    critical_alerts = [a for a in alerts if a['level'] == 'critical']
+    warning_alerts = [a for a in alerts if a['level'] == 'warning']
+    
+    text_parts = ["🔐 凭证过期告警\n"]
+    if critical_alerts:
+        text_parts.append(f"🔴 高危（≤{CREDENTIAL_CRIT_DAYS}天/已过期）:")
+        for a in critical_alerts:
+            days_str = "已过期" if a['days_left'] < 0 else f"剩余{a['days_left']}天"
+            text_parts.append(f"  • {a['name']}({a['type']}) - {a['expiry_date']} ({days_str})")
+    if warning_alerts:
+        text_parts.append(f"\n🟡 预警（≤{CREDENTIAL_WARN_DAYS}天）:")
+        for a in warning_alerts:
+            text_parts.append(f"  • {a['name']}({a['type']}) - {a['expiry_date']} (剩余{a['days_left']}天)")
+    
+    payload = {
+        "msg_type": "text",
+        "content": {"text": "\n".join(text_parts)}
+    }
+    requests.post(CREDENTIAL_ALERT_WEBHOOK, json=payload, timeout=10)
+    logger.info(f"已发送凭证过期飞书告警: {len(alerts)} 条")
+
+
+def send_email_credential_alert(alerts):
+    """发送凭证过期邮件告警"""
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+    import smtplib
+    
+    smtp_host = os.getenv('SMTP_HOST', '')
+    smtp_port = int(os.getenv('SMTP_PORT', '587'))
+    smtp_user = os.getenv('SMTP_USER', '')
+    smtp_password = os.getenv('SMTP_PASSWORD', '')
+    smtp_from = os.getenv('SMTP_FROM', smtp_user)
+    smtp_use_tls = os.getenv('SMTP_USE_TLS', 'true').lower() == 'true'
+    
+    if not smtp_host or not smtp_user:
+        logger.warning("SMTP 未配置，跳过邮件告警")
+        return
+    
+    emails = [e.strip() for e in CREDENTIAL_ALERT_EMAILS.split(',') if e.strip()]
+    
+    critical_alerts = [a for a in alerts if a['level'] == 'critical']
+    warning_alerts = [a for a in alerts if a['level'] == 'warning']
+    
+    html_parts = [
+        '<html><body>',
+        '<h2>🔐 凭证过期告警</h2>',
+        '<p>以下凭证即将过期或已过期，请及时处理：</p>',
+    ]
+    
+    if critical_alerts:
+        html_parts.append(f'<h3 style="color:red">🔴 高危告警（≤{CREDENTIAL_CRIT_DAYS}天或已过期）</h3>')
+        html_parts.append('<table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse">')
+        html_parts.append('<tr style="background:#fee"><th>名称</th><th>类型</th><th>过期日期</th><th>剩余天数</th><th>负责人</th></tr>')
+        for a in critical_alerts:
+            days_str = "已过期" if a['days_left'] < 0 else f"{a['days_left']}天"
+            html_parts.append(f'<tr><td>{a["name"]}</td><td>{a["type"]}</td><td>{a["expiry_date"]}</td><td style="color:red;font-weight:bold">{days_str}</td><td>{a["owner"]}</td></tr>')
+        html_parts.append('</table>')
+    
+    if warning_alerts:
+        html_parts.append(f'<h3 style="color:orange">🟡 预警（≤{CREDENTIAL_WARN_DAYS}天）</h3>')
+        html_parts.append('<table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse">')
+        html_parts.append('<tr style="background:#ffe"><th>名称</th><th>类型</th><th>过期日期</th><th>剩余天数</th><th>负责人</th></tr>')
+        for a in warning_alerts:
+            html_parts.append(f'<tr><td>{a["name"]}</td><td>{a["type"]}</td><td>{a["expiry_date"]}</td><td style="color:orange;font-weight:bold">{a["days_left"]}天</td><td>{a["owner"]}</td></tr>')
+        html_parts.append('</table>')
+    
+    html_parts.append('</body></html>')
+    
+    msg = MIMEMultipart('alternative')
+    msg['Subject'] = f'[凭证过期告警] {len(critical_alerts)}个高危 / {len(warning_alerts)}个预警'
+    msg['From'] = smtp_from
+    msg['To'] = ', '.join(emails)
+    msg.attach(MIMEText(''.join(html_parts), 'html', 'utf-8'))
+    
+    with smtplib.SMTP(smtp_host, smtp_port) as server:
+        if smtp_use_tls:
+            server.starttls()
+        if smtp_password:
+            server.login(smtp_user, smtp_password)
+        server.sendmail(smtp_from, emails, msg.as_string())
+    
+    logger.info(f"已发送凭证过期邮件告警到: {emails}")
 
 
 def scrape_agent(agent):
@@ -453,6 +628,67 @@ def _check_cert_directly(target):
     return metrics
 
 
+def _check_cert_via_agent(agent, target):
+    """通过 Agent 代理检测单个目标的 SSL 证书
+    调用 Agent 的 POST /api/v1/check 端点，让 Agent 从它所在的网络环境去检测目标
+    适用于 pull 模式 Agent：Agent 虽然 heartbeat 超时但 HTTP 可达的情况
+    """
+    host = agent.get('host', '')
+    port = agent.get('port', 8091)
+    name = agent.get('name', f"{host}:{port}")
+    use_https = agent.get('use_https', False)
+    protocols = ["https", "http"] if use_https else ["http", "https"]
+    
+    url = target.get('url', '')
+    parsed = _parse_target_url(url)
+    
+    payload = {
+        'url': url,
+        'timeout': target.get('timeout', 30),
+        'service_name': target.get('service_name', url),
+        'owner': target.get('owner', 'unknown'),
+        'owner_email': target.get('owner_email', ''),
+        'env': target.get('env', 'production')
+    }
+    
+    for protocol in protocols:
+        check_url = f"{protocol}://{host}:{port}/api/v1/check"
+        try:
+            logger.info(f"[Agent代理] 请求 Agent [{name}] 检测: {parsed['host']}:{parsed['port']} (via {protocol.upper()})")
+            resp = requests.post(check_url, json=payload, timeout=30, verify=VERIFY_SSL)
+            resp.raise_for_status()
+            
+            data = resp.json()
+            metrics = data.get('metrics', [])
+            
+            # 为每个指标添加 agent 来源信息
+            for m in metrics:
+                m['agent_id'] = agent.get('agent_id', '')
+                m['agent_name'] = name
+                m['agent_hostname'] = data.get('agent_info', {}).get('hostname', host)
+                m['scraped_at'] = datetime.now().isoformat()
+                m['source'] = 'agent_proxy'  # 标记为 agent 代理检测
+            
+            logger.info(f"[Agent代理] Agent [{name}] 返回 {len(metrics)} 条指标 for {parsed['host']}:{parsed['port']}")
+            return metrics
+            
+        except requests.exceptions.ConnectionError:
+            logger.warning(f"[Agent代理] 无法连接 Agent [{name}] via {protocol.upper()}")
+            continue
+        except requests.exceptions.Timeout:
+            logger.warning(f"[Agent代理] Agent [{name}] 超时 ({protocol.upper()})")
+            continue
+        except Exception as e:
+            logger.error(f"[Agent代理] Agent [{name}] 请求失败 ({protocol.upper()}): {e}")
+            continue
+    
+    # Agent 完全不可达，返回失败指标
+    logger.warning(f"[Agent代理] Agent [{name}] 完全不可达，回退到失败标记 for {parsed['host']}:{parsed['port']}")
+    fail_metric = _create_direct_metric('ssl_cert_check_success', 0, target)
+    fail_metric['source'] = 'agent_proxy_unreachable'
+    return [fail_metric]
+
+
 # WebTrust CA 组织名称列表
 WEBTRUST_CA_PATTERNS = [
     'DigiCert', 'GlobalSign', "Let's Encrypt", 'ISRG', 'Comodo', 'Sectigo',
@@ -479,7 +715,7 @@ def _is_webtrust_ca(issuer_org: str) -> bool:
 def _create_direct_metric(metric_name, value, target):
     """创建直接检测的指标对象"""
     parsed = _parse_target_url(target.get('url', ''))
-    return {
+    metric = {
         'metric_name': metric_name,
         'metric_type': metric_name,
         'value': value,
@@ -488,67 +724,144 @@ def _create_direct_metric(metric_name, value, target):
         'service_name': target.get('service_name', target.get('url', '')),
         'owner': target.get('owner', 'unknown'),
         'owner_email': target.get('owner_email', ''),
-        'env': target.get('env', 'production')
+        'env': target.get('env', 'production'),
+        'agent_hostname': target.get('_fallback_agent_host', 'unknown'),
     }
+    return metric
 
 
 def scrape_direct_targets():
-    """直接检测未分配 Agent 的目标"""
-    global SERVER_TARGETS, METRICS_BUFFER
+    """检测未分配 Agent 的目标 + Agent 兜底目标
+    - 未分配 Agent 的目标: Server 直接检测
+    - 有 Agent 分配但 heartbeat 超时的目标: 全部通过 Agent API 代理检测（不走 Direct fallback）
+    """
+    # 1. 未分配 Agent 的目标（走 Direct）
+    unassigned_targets = db.get_targets(agent_id='', enabled_only=True)
     
-    with TARGETS_LOCK:
-        targets = [t for t in SERVER_TARGETS if not t.get('agent_id') and t.get('enabled', True)]
+    # 2. 获取需要代理检测的 Agent 目标
+    proxy_agent_targets = _get_agent_targets_for_proxy()
     
-    if not targets:
-        logger.debug("没有未分配 Agent 的目标需要直接检测")
+    if proxy_agent_targets:
+        logger.info(f"发现 {len(proxy_agent_targets)} 个 Agent 目标，将通过 Agent 代理检测")
+    
+    if not unassigned_targets and not proxy_agent_targets:
+        logger.debug("没有需要检测的目标")
         return []
-    
-    logger.info(f"开始直接检测 {len(targets)} 个目标...")
     
     all_metrics = []
     
-    # 使用线程池并发检测
-    max_workers = min(len(targets), 10)
+    # === 3. 通过 Agent API 代理检测所有 Agent 目标 ===
+    for t in proxy_agent_targets:
+        proxy_agent = t.pop('_proxy_agent', None)
+        if proxy_agent:
+            try:
+                metrics = _check_cert_via_agent(proxy_agent, t)
+                all_metrics.extend(metrics)
+            except Exception as e:
+                logger.error(f"Agent代理检测异常: {t.get('url', '')} - {e}")
+                all_metrics.append(_create_direct_metric('ssl_cert_check_success', 0, t))
     
-    def check_target(target):
-        try:
-            return _check_cert_directly(target)
-        except Exception as e:
-            logger.error(f"检测目标异常: {target.get('url', '')} - {e}")
-            return [_create_direct_metric('ssl_cert_check_success', 0, target)]
+    # === 4. Server 直接检测未分配 Agent 的目标 ===
+    if unassigned_targets:
+        logger.info(f"开始直接检测 {len(unassigned_targets)} 个未分配 Agent 的目标...")
+        
+        max_workers = min(len(unassigned_targets), 10)
+        
+        def check_target(target):
+            try:
+                return _check_cert_directly(target)
+            except Exception as e:
+                logger.error(f"检测目标异常: {target.get('url', '')} - {e}")
+                return [_create_direct_metric('ssl_cert_check_success', 0, target)]
+        
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+        futures = {executor.submit(check_target, t): t for t in unassigned_targets}
+        
+        done, not_done = wait(futures.keys(), timeout=60)
+        
+        for future in done:
+            try:
+                result = future.result()
+                if result:
+                    all_metrics.extend(result)
+            except Exception as e:
+                logger.error(f"获取结果异常: {e}")
+        
+        for future in not_done:
+            future.cancel()
+            target = futures[future]
+            logger.warning(f"目标检测超时: {target.get('url', '')}")
+        
+        executor.shutdown(wait=False)
     
-    executor = ThreadPoolExecutor(max_workers=max_workers)
-    futures = {executor.submit(check_target, t): t for t in targets}
-    
-    done, not_done = wait(futures.keys(), timeout=60)
-    
-    for future in done:
-        try:
-            result = future.result()
-            if result:
-                all_metrics.extend(result)
-        except Exception as e:
-            logger.error(f"获取结果异常: {e}")
-    
-    for future in not_done:
-        future.cancel()
-        target = futures[future]
-        logger.warning(f"目标检测超时: {target.get('url', '')}")
-    
-    executor.shutdown(wait=False)
-    
-    # 添加时间戳和来源标记
+    # === 5. 添加时间戳 ===
     timestamp = datetime.now().isoformat()
     for m in all_metrics:
         m['timestamp'] = timestamp
-        m['source'] = 'direct'
     
-    logger.info(f"直接检测完成，共 {len(all_metrics)} 条指标")
+    logger.info(f"目标检测完成，共 {len(all_metrics)} 条指标")
     return all_metrics
 
 
+def _get_agent_targets_for_proxy():
+    """获取所有 heartbeat 超时的 Agent 及其目标，全部走 Agent API 代理检测
+    不再走 Direct fallback — Server 不自己检测，而是调用 Agent 的 /api/v1/check
+    注意: heartbeat 正常的 Agent 目标由 scrape_agent() 处理，不在此处
+    返回: 代理检测目标列表（每项附带了 _proxy_agent 字段）
+    """
+    agents = db.get_agents()
+    agents_map = {a.get('agent_id'): a for a in agents if a.get('agent_id')}
+    
+    timeout_agent_ids = set()
+    
+    for agent in agents:
+        agent_id = agent.get('agent_id', '')
+        if not agent_id:
+            continue
+        
+        # 检查 heartbeat
+        heartbeat_info = db.get_heartbeat(agent_id)
+        has_recent_hb = False
+        if heartbeat_info:
+            last_hb = heartbeat_info.get('last_heartbeat')
+            if last_hb and isinstance(last_hb, str):
+                last_hb = datetime.fromisoformat(last_hb)
+            time_since_hb = (datetime.now() - last_hb).total_seconds() if last_hb else None
+            if time_since_hb is not None and time_since_hb <= HEARTBEAT_TIMEOUT:
+                has_recent_hb = True
+        
+        if has_recent_hb:
+            # Agent 活跃，scrape_agent() 会处理
+            continue
+        
+        # heartbeat 超时 → 全部走代理检测
+        timeout_agent_ids.add(agent_id)
+    
+    if not timeout_agent_ids:
+        return []
+    
+    # 获取这些 Agent 的所有目标
+    all_targets = db.get_targets(enabled_only=True)
+    proxy_targets = []
+    
+    for t in all_targets:
+        target_agent_id = t.get('agent_id', '')
+        if target_agent_id in timeout_agent_ids:
+            agent = agents_map.get(target_agent_id, {})
+            t['_fallback_agent_name'] = agent.get('name', t.get('agent_id', ''))
+            t['_fallback_agent_host'] = agent.get('host', 'unknown')
+            t['_proxy_agent'] = agent  # 携带 agent 配置供代理检测使用
+            proxy_targets.append(t)
+    
+    return proxy_targets
+
+
 def scrape_all_agents():
-    """从所有 Agent 拉取数据 + 直接检测未分配 Agent 的目标"""
+    """从所有 Agent 拉取数据 + 直接检测未分配 Agent 的目标
+    - push 模式 Agent: 不拉取，它们会主动推送
+    - pull 模式 Agent: 主动拉取
+    - dual 模式 Agent: 主动拉取（它们也暴露了端口，拉取作为数据冗余）
+    """
     global METRICS_BUFFER
     
     config = load_config()
@@ -556,15 +869,40 @@ def scrape_all_agents():
     
     all_metrics = []
     
-    # 1. 从 Agent 拉取数据
-    if agents:
-        for agent in agents:
+    # 1. 分类 Agent
+    push_only_agents = []
+    pull_agents = []
+    dual_agents = []
+    
+    for a in agents:
+        mode = a.get('agent_mode', '')
+        if mode == 'push':
+            push_only_agents.append(a)
+        elif mode == 'dual':
+            dual_agents.append(a)
+        else:
+            # 兼容旧的 push_mode 配置
+            if a.get('push_mode', False) and mode != 'dual':
+                push_only_agents.append(a)
+            else:
+                pull_agents.append(a)
+    
+    if push_only_agents:
+        logger.debug(f"跳过 {len(push_only_agents)} 个推送模式 Agent（它们会主动推送数据）")
+    
+    # 从 pull 和 dual 模式的 Agent 拉取数据
+    agents_to_pull = pull_agents + dual_agents
+    
+    if agents_to_pull:
+        for agent in agents_to_pull:
             metrics, success = scrape_agent(agent)
+            mode = agent.get('agent_mode', 'pull')
             for m in metrics:
-                m['source'] = 'agent'
+                m['source'] = f'agent_{mode}'
             all_metrics.extend(metrics)
     else:
-        logger.info("没有配置 Agent")
+        if not push_only_agents and not dual_agents:
+            logger.info("没有配置 Agent")
     
     # 2. 直接检测未分配 Agent 的目标
     direct_metrics = scrape_direct_targets()
@@ -580,7 +918,7 @@ def scrape_all_agents():
         # 异步保存到文件
         threading.Thread(target=_save_metrics_async, args=(all_metrics,), daemon=True).start()
         
-        logger.info(f"本次共获取 {len(all_metrics)} 条指标 (Agent: {len(all_metrics) - len(direct_metrics)}, Direct: {len(direct_metrics)})")
+        logger.info(f"本次共获取 {len(all_metrics)} 条指标 (Agent拉取: {len(all_metrics) - len(direct_metrics)}, 直接检测: {len(direct_metrics)})")
 
 
 def _save_metrics_async(metrics):
@@ -596,7 +934,7 @@ def _save_metrics_async(metrics):
 
 def _scrape_loop():
     """定时拉取循环"""
-    global SCRAPE_INTERVAL, DIRECT_SCRAPE_INTERVAL, TARGETS_LAST_SYNC
+    global SCRAPE_INTERVAL, DIRECT_SCRAPE_INTERVAL
     
     config = load_config()
     SCRAPE_INTERVAL = config.get('settings', {}).get('scrape_interval', 60)
@@ -662,7 +1000,7 @@ def stats():
     config = load_config()
     agents = config.get('agents', [])
     
-    # 实时探测 Agent 状态
+    # 判断 Agent 在线状态（优先心跳，其次探测）
     online_count = 0
     for agent in agents:
         probed = _probe_agent(agent)
@@ -678,12 +1016,15 @@ def stats():
         'metrics': {
             'buffer_size': len(METRICS_BUFFER)
         },
-        'scrape_interval': SCRAPE_INTERVAL
+        'scrape_interval': SCRAPE_INTERVAL,
+        'heartbeat_timeout': HEARTBEAT_TIMEOUT
     })
 
 
 def _probe_agent(agent):
-    """探测 Agent 的在线状态和真实信息"""
+    """探测 Agent 的在线状态和真实信息
+    优先使用心跳记录判断在线状态（push/dual 模式），其次尝试主动探测（pull/dual 模式兼容）
+    """
     agent_id = agent.get('agent_id', '')
     host = agent.get('host', '')
     port = agent.get('port', 8091)
@@ -700,50 +1041,77 @@ def _probe_agent(agent):
         'status': 'offline',
         'last_heartbeat': None,
         'metrics_count': 0,
+        'push_mode': agent.get('push_mode', False),
+        'agent_mode': agent.get('agent_mode', 'push' if agent.get('push_mode', False) else 'pull'),
         'error': None
     }
     
-    # 根据 Agent 配置决定协议，默认先尝试 HTTP
-    use_https = agent.get('use_https', False)
-    protocols = ["https", "http"] if use_https else ["http", "https"]
+    # 1. 优先检查心跳记录（push/dual 模式）
+    heartbeat_info = db.get_heartbeat(agent_id)
     
-    # 尝试连接 Agent 的 /info 和 /health 接口获取真实信息
-    for protocol in protocols:
-        urls_to_try = [
-            f"{protocol}://{host}:{port}/info",
-            f"{protocol}://{host}:{port}/health"
-        ]
+    if heartbeat_info:
+        last_hb = heartbeat_info.get('last_heartbeat')
+        if last_hb and isinstance(last_hb, str):
+            last_hb = datetime.fromisoformat(last_hb)
+        time_since_hb = (datetime.now() - last_hb).total_seconds() if last_hb else None
+        hb_mode = heartbeat_info.get('agent_mode', 'push')
         
-        for url in urls_to_try:
-            try:
-                resp = requests.get(url, timeout=10, verify=VERIFY_SSL)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    result['status'] = 'online'
-                    result['last_heartbeat'] = datetime.now().isoformat()
-                    
-                    # 从 /info 接口获取真实主机名和 IP
-                    if url.endswith('/info'):
-                        agent_info = data.get('agent_info', {})
-                        result['hostname'] = agent_info.get('hostname') or host
-                        result['ip'] = agent_info.get('ip') or host
-                        result['metrics_count'] = data.get('config', {}).get('targets_count', 0)
-                    else:
-                        # /health 接口
-                        result['hostname'] = host
-                        result['ip'] = host
-                        result['metrics_count'] = data.get('metrics_buffer_size', 0)
-                    
-                    return result
-            except requests.exceptions.ConnectionError:
-                result['error'] = 'connection_refused'
-                continue
-            except requests.exceptions.Timeout:
-                result['error'] = 'timeout'
-                continue
-            except Exception as e:
-                result['error'] = str(e)
-                continue
+        if time_since_hb is not None and time_since_hb <= HEARTBEAT_TIMEOUT:
+            # 心跳未超时，Agent 在线
+            result['status'] = 'online'
+            result['last_heartbeat'] = last_hb.isoformat() if hasattr(last_hb, 'isoformat') else str(last_hb)
+            result['hostname'] = heartbeat_info.get('agent_info', {}).get('hostname') or host
+            result['ip'] = heartbeat_info.get('agent_info', {}).get('ip') or host
+            result['metrics_count'] = heartbeat_info.get('targets_count', 0)
+            result['push_mode'] = hb_mode in ('push', 'dual')
+            result['agent_mode'] = hb_mode
+            result['local_targets_count'] = len(heartbeat_info.get('local_targets', []))
+            return result
+        elif time_since_hb is not None:
+            # 心跳超时，但记录过
+            result['last_heartbeat'] = last_hb.isoformat() if hasattr(last_hb, 'isoformat') else str(last_hb)
+            result['hostname'] = heartbeat_info.get('agent_info', {}).get('hostname') or host
+            result['ip'] = heartbeat_info.get('agent_info', {}).get('ip') or host
+    
+    # 2. 如果没有心跳记录或已超时，且 Agent 配置了端口，尝试主动探测（pull/dual 模式兼容）
+    if port and port > 0:
+        use_https = agent.get('use_https', False)
+        protocols = ["https", "http"] if use_https else ["http", "https"]
+        
+        for protocol in protocols:
+            urls_to_try = [
+                f"{protocol}://{host}:{port}/info",
+                f"{protocol}://{host}:{port}/health"
+            ]
+            
+            for url in urls_to_try:
+                try:
+                    resp = requests.get(url, timeout=10, verify=VERIFY_SSL)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        result['status'] = 'online'
+                        result['last_heartbeat'] = datetime.now().isoformat()
+                        
+                        if url.endswith('/info'):
+                            agent_info = data.get('agent_info', {})
+                            result['hostname'] = agent_info.get('hostname') or host
+                            result['ip'] = agent_info.get('ip') or host
+                            result['metrics_count'] = data.get('config', {}).get('targets_count', 0)
+                        else:
+                            result['hostname'] = host
+                            result['ip'] = host
+                            result['metrics_count'] = data.get('metrics_buffer_size', 0)
+                        
+                        return result
+                except requests.exceptions.ConnectionError:
+                    result['error'] = 'connection_refused'
+                    continue
+                except requests.exceptions.Timeout:
+                    result['error'] = 'timeout'
+                    continue
+                except Exception as e:
+                    result['error'] = str(e)
+                    continue
     
     # 所有尝试都失败
     return result
@@ -774,14 +1142,25 @@ def add_agent():
     
     agent = {
         'agent_id': data.get('agent_id', str(time.time())),
-        'host': data.get('host'),
-        'port': data.get('port', 8091),
-        'name': data.get('name', f"{data.get('host')}:{data.get('port', 8091)}"),
-        'enabled': data.get('enabled', True)
+        'host': data.get('host', ''),
+        'port': data.get('port', 0),  # push 模式默认 port=0
+        'name': data.get('name', f"{data.get('host', 'unknown')}"),
+        'enabled': data.get('enabled', True),
+        'push_mode': data.get('push_mode', True),  # 兼容旧字段
+        'agent_mode': data.get('agent_mode', 'push'),  # 新字段: push/pull/dual
+        'use_https': data.get('use_https', False)
     }
     
-    if not agent['host']:
-        return jsonify({'error': 'host is required'}), 400
+    # 根据 agent_mode 设置 push_mode 兼容字段
+    if agent['agent_mode'] in ('push', 'dual'):
+        agent['push_mode'] = True
+    else:
+        agent['push_mode'] = False
+    
+    # push 模式下 host 可以为空（Agent 主动连接 Server）
+    # pull/dual 模式下 host 必填（Server 需要连接 Agent）
+    if agent['agent_mode'] in ('pull', 'dual') and not agent['host']:
+        return jsonify({'error': 'host is required for pull/dual mode agent'}), 400
     
     # 保存到配置
     config = load_config()
@@ -791,7 +1170,11 @@ def add_agent():
     # 检查是否已存在
     existing = False
     for i, a in enumerate(config['agents']):
-        if a.get('host') == agent['host'] and a.get('port') == agent['port']:
+        if a.get('agent_id') == agent['agent_id']:
+            config['agents'][i] = agent
+            existing = True
+            break
+        if agent['host'] and a.get('host') == agent['host'] and a.get('port') == agent['port']:
             config['agents'][i] = agent
             existing = True
             break
@@ -801,25 +1184,18 @@ def add_agent():
     
     save_config(config)
     
-    # 添加后立即探测一次，返回实时状态
+    # 探测一次，返回实时状态
     probed = _probe_agent(agent)
     
-    logger.info(f"添加/更新 Agent: {agent['name']}, 状态: {probed['status']}")
+    logger.info(f"添加/更新 Agent: {agent['name']} (推送模式: {agent.get('push_mode', True)}), 状态: {probed['status']}")
     return jsonify({'status': 'success', 'agent': probed})
 
 
 @app.route('/api/v1/agents/<agent_id>', methods=['DELETE'])
 def delete_agent(agent_id):
     """删除 Agent"""
-    config = load_config()
-    config['agents'] = [a for a in config.get('agents', []) if a.get('agent_id') != agent_id]
-    save_config(config)
-    
-    # 删除该 Agent 关联的目标
-    with TARGETS_LOCK:
-        global SERVER_TARGETS
-        SERVER_TARGETS = [t for t in SERVER_TARGETS if t.get('agent_id') != agent_id]
-        save_targets_config()
+    db.delete_agent(agent_id)
+    save_targets_config()  # 同步辅助文件
     
     logger.info(f"删除 Agent: {agent_id}")
     return jsonify({'status': 'success'})
@@ -829,7 +1205,8 @@ def delete_agent(agent_id):
 def discover_agent_targets(agent_id):
     """
     从 Agent 自动发现目标并同步到 Server
-    将 Agent 本地的 targets.json 中的目标同步到 ssl_targets.json
+    将 Agent 本地的 targets.json 中的目标同步到数据库
+    支持 pull/dual 模式（主动连接 Agent）和 push 模式（从心跳中获取）
     """
     config = load_config()
     agents = config.get('agents', [])
@@ -844,10 +1221,77 @@ def discover_agent_targets(agent_id):
     if not agent:
         return jsonify({'status': 'error', 'message': 'Agent not found'}), 404
     
+    agent_mode = agent.get('agent_mode', 'pull')
     host = agent.get('host')
     port = agent.get('port', 8091)
     
-    # 根据 Agent 配置决定协议，默认先尝试 HTTP
+    # 对于 push 模式的 Agent，优先从心跳数据中获取本地目标
+    if agent_mode == 'push':
+        heartbeat_info = db.get_heartbeat(agent_id) or {}
+        local_targets = heartbeat_info.get('local_targets', [])
+        
+        if local_targets:
+            # 将心跳中的本地目标同步到数据库
+            new_targets = []
+            updated_count = 0
+            added_count = 0
+            
+            for target_info in local_targets:
+                target_url = target_info.get('url', '')
+                if not target_url:
+                    continue
+                
+                # 使用 uuid 避免与其他 Agent 的目标 ID 冲突
+                existing = db.get_target_by_url(target_url, agent_id)
+                
+                new_target = {
+                    'id': existing['id'] if existing else str(uuid.uuid4()),
+                    'url': target_url,
+                    'service_name': target_info.get('service_name', target_url),
+                    'owner': target_info.get('owner', 'unknown'),
+                    'owner_email': target_info.get('owner_email', ''),
+                    'env': target_info.get('env', 'production'),
+                    'agent_id': agent_id,
+                    'enabled': target_info.get('enabled', True),
+                    'timeout': target_info.get('timeout', 30),
+                    'check_interval': target_info.get('check_interval', 180),
+                    'synced_from_agent': True
+                }
+                
+                if existing:
+                    updated_count += 1
+                else:
+                    added_count += 1
+                    new_targets.append(new_target)
+                
+                db.upsert_target(new_target)
+            
+            save_targets_config()
+            
+            threading.Thread(target=trigger_exporter_reload, daemon=True).start()
+            
+            logger.info(f"从推送模式 Agent {agent_id} 心跳同步目标: 新增 {added_count}, 更新 {updated_count}")
+            
+            return jsonify({
+                'status': 'success',
+                'message': f'从 Agent 心跳同步: 新增 {added_count}, 更新 {updated_count}',
+                'added': added_count,
+                'updated': updated_count,
+                'targets': new_targets
+            })
+        
+        # push 模式心跳无本地目标，尝试 pull 方式（如果有 host）
+        if not host:
+            return jsonify({
+                'status': 'success',
+                'message': '推送模式 Agent 暂无本地目标（Agent 会在心跳中上报目标列表）',
+                'synced': 0,
+                'total': 0,
+                'targets': []
+            })
+        # 有 host 则 fallthrough 到 pull 模式
+    
+    # pull/dual 模式：主动连接 Agent 获取目标
     use_https = agent.get('use_https', False)
     protocols = ["https", "http"] if use_https else ["http", "https"]
     
@@ -881,52 +1325,43 @@ def discover_agent_targets(agent_id):
             'total': 0
         })
     
-    # 同步目标到 SERVER_TARGETS
+    # 同步目标到数据库
     try:
-        with TARGETS_LOCK:
-            global SERVER_TARGETS
-            new_targets = []
-            updated_count = 0
-            added_count = 0
+        new_targets = []
+        updated_count = 0
+        added_count = 0
+        
+        for target in agent_targets:
+            target_url = target.get('url', '')
+            if not target_url:
+                continue
             
-            for target in agent_targets:
-                target_url = target.get('url', '')
-                if not target_url:
-                    continue
-                
-                # 检查是否已存在（按 URL 匹配）
-                existing = None
-                for i, t in enumerate(SERVER_TARGETS):
-                    if t.get('url') == target_url:
-                        existing = (i, t)
-                        break
-                
-                # 构建目标数据
-                new_target = {
-                    'id': target.get('id', str(hash(target_url))),
-                    'url': target_url,
-                    'service_name': target.get('service_name', target_url),
-                    'owner': target.get('owner', 'unknown'),
-                    'owner_email': target.get('owner_email', ''),
-                    'env': target.get('env', 'production'),
-                    'agent_id': agent_id,
-                    'enabled': target.get('enabled', True),
-                    'timeout': target.get('timeout', 10),
-                    'check_interval': target.get('check_interval', 180),
-                    'synced_from_agent': True
-                }
-                
-                if existing:
-                    # 更新现有目标
-                    SERVER_TARGETS[existing[0]] = new_target
-                    updated_count += 1
-                else:
-                    # 添加新目标
-                    SERVER_TARGETS.append(new_target)
-                    new_targets.append(new_target)
-                    added_count += 1
+            # 构建目标数据 - 使用 uuid 避免与其他 Agent 的目标 ID 冲突
+            existing = db.get_target_by_url(target_url, agent_id)
             
-            save_targets_config()
+            new_target = {
+                'id': existing['id'] if existing else str(uuid.uuid4()),
+                'url': target_url,
+                'service_name': target.get('service_name', target_url),
+                'owner': target.get('owner', 'unknown'),
+                'owner_email': target.get('owner_email', ''),
+                'env': target.get('env', 'production'),
+                'agent_id': agent_id,
+                'enabled': target.get('enabled', True),
+                'timeout': target.get('timeout', 10),
+                'check_interval': target.get('check_interval', 180),
+                'synced_from_agent': True
+            }
+            
+            if existing:
+                updated_count += 1
+            else:
+                added_count += 1
+                new_targets.append(new_target)
+            
+            db.upsert_target(new_target)
+        
+        save_targets_config()
         
         # 触发 Exporter 重新加载
         threading.Thread(target=trigger_exporter_reload, daemon=True).start()
@@ -963,6 +1398,7 @@ def discover_agent_targets(agent_id):
 def discover_all_agents_targets():
     """
     从所有已配置的 Agent 自动发现并同步目标
+    支持 push 模式（从心跳获取）和 pull/dual 模式（主动连接）
     """
     config = load_config()
     agents = config.get('agents', [])
@@ -970,16 +1406,90 @@ def discover_all_agents_targets():
     results = []
     total_added = 0
     total_updated = 0
+    all_new_targets = []
     
     for agent in agents:
         if not agent.get('enabled', True):
             continue
             
         agent_id = agent.get('agent_id')
+        agent_mode = agent.get('agent_mode', 'pull')
         host = agent.get('host')
         port = agent.get('port', 8091)
+        agent_name = agent.get('name', f'{host}:{port}')
         
-        # 根据 Agent 配置决定协议，默认先尝试 HTTP
+        added_count = 0
+        updated_count = 0
+        agent_new_targets = []
+        
+        # 1. push 模式：优先从心跳数据获取目标
+        if agent_mode == 'push':
+            heartbeat_info = db.get_heartbeat(agent_id) or {}
+            local_targets = heartbeat_info.get('local_targets', [])
+            
+            if local_targets:
+                for target_info in local_targets:
+                    target_url = target_info.get('url', '')
+                    if not target_url:
+                        continue
+                    
+                    existing = db.get_target_by_url(target_url, agent_id)
+                    new_target = {
+                        'id': existing['id'] if existing else str(uuid.uuid4()),
+                        'url': target_url,
+                        'service_name': target_info.get('service_name', target_url),
+                        'owner': target_info.get('owner', 'unknown'),
+                        'owner_email': target_info.get('owner_email', ''),
+                        'env': target_info.get('env', 'production'),
+                        'agent_id': agent_id,
+                        'enabled': target_info.get('enabled', True),
+                        'timeout': target_info.get('timeout', 30),
+                        'check_interval': target_info.get('check_interval', 180),
+                        'synced_from_agent': True
+                    }
+                    
+                    if existing:
+                        updated_count += 1
+                    else:
+                        added_count += 1
+                        agent_new_targets.append(new_target)
+                    
+                    db.upsert_target(new_target)
+                
+                if added_count > 0 or updated_count > 0:
+                    save_targets_config()
+                
+                total_added += added_count
+                total_updated += updated_count
+                all_new_targets.extend(agent_new_targets)
+                
+                results.append({
+                    'agent_id': agent_id,
+                    'agent_name': agent_name,
+                    'status': 'success',
+                    'source': 'heartbeat',
+                    'targets_found': len(local_targets),
+                    'added': added_count,
+                    'updated': updated_count
+                })
+                continue
+            else:
+                # 心跳无目标，尝试 pull 方式（如果有 host）
+                if not host:
+                    results.append({
+                        'agent_id': agent_id,
+                        'agent_name': agent_name,
+                        'status': 'success',
+                        'source': 'heartbeat',
+                        'message': '推送模式 Agent 暂无本地目标',
+                        'targets_found': 0,
+                        'added': 0,
+                        'updated': 0
+                    })
+                    continue
+                # fallthrough 到 pull 模式
+        
+        # 2. pull/dual 模式：主动连接 Agent 获取目标
         use_https = agent.get('use_https', False)
         protocols = ["https", "http"] if use_https else ["http", "https"]
         
@@ -998,8 +1508,9 @@ def discover_all_agents_targets():
         if not resp or resp.status_code != 200:
             results.append({
                 'agent_id': agent_id,
-                'agent_name': agent.get('name', f'{host}:{port}'),
+                'agent_name': agent_name,
                 'status': 'error',
+                'source': 'pull',
                 'message': f'HTTP {resp.status_code if resp else "connection_failed"}: {last_error or "unknown"}',
                 'added': 0,
                 'updated': 0
@@ -1010,54 +1521,46 @@ def discover_all_agents_targets():
         agent_targets = data.get('targets', [])
         
         try:
-            # 同步目标
-            with TARGETS_LOCK:
-                global SERVER_TARGETS
-                added_count = 0
-                updated_count = 0
+            for target in agent_targets:
+                target_url = target.get('url', '')
+                if not target_url:
+                    continue
                 
-                for target in agent_targets:
-                    target_url = target.get('url', '')
-                    if not target_url:
-                        continue
-                    
-                    existing = None
-                    for i, t in enumerate(SERVER_TARGETS):
-                        if t.get('url') == target_url:
-                            existing = (i, t)
-                            break
-                    
-                    new_target = {
-                        'id': target.get('id', str(hash(target_url))),
-                        'url': target_url,
-                        'service_name': target.get('service_name', target_url),
-                        'owner': target.get('owner', 'unknown'),
-                        'owner_email': target.get('owner_email', ''),
-                        'env': target.get('env', 'production'),
-                        'agent_id': agent_id,
-                        'enabled': target.get('enabled', True),
-                        'timeout': target.get('timeout', 10),
-                        'check_interval': target.get('check_interval', 180),
-                        'synced_from_agent': True
-                    }
-                    
-                    if existing:
-                        SERVER_TARGETS[existing[0]] = new_target
-                        updated_count += 1
-                    else:
-                        SERVER_TARGETS.append(new_target)
-                        added_count += 1
+                existing = db.get_target_by_url(target_url, agent_id)
+                new_target = {
+                    'id': existing['id'] if existing else str(uuid.uuid4()),
+                    'url': target_url,
+                    'service_name': target.get('service_name', target_url),
+                    'owner': target.get('owner', 'unknown'),
+                    'owner_email': target.get('owner_email', ''),
+                    'env': target.get('env', 'production'),
+                    'agent_id': agent_id,
+                    'enabled': target.get('enabled', True),
+                    'timeout': target.get('timeout', 10),
+                    'check_interval': target.get('check_interval', 180),
+                    'synced_from_agent': True
+                }
                 
-                if added_count > 0 or updated_count > 0:
-                    save_targets_config()
+                if existing:
+                    updated_count += 1
+                else:
+                    added_count += 1
+                    agent_new_targets.append(new_target)
+                
+                db.upsert_target(new_target)
+            
+            if added_count > 0 or updated_count > 0:
+                save_targets_config()
             
             total_added += added_count
             total_updated += updated_count
+            all_new_targets.extend(agent_new_targets)
             
             results.append({
                 'agent_id': agent_id,
-                'agent_name': agent.get('name', f'{host}:{port}'),
+                'agent_name': agent_name,
                 'status': 'success',
+                'source': 'pull',
                 'targets_found': len(agent_targets),
                 'added': added_count,
                 'updated': updated_count
@@ -1084,6 +1587,8 @@ def discover_all_agents_targets():
         'message': f'Total: {total_added} added, {total_updated} updated',
         'total_added': total_added,
         'total_updated': total_updated,
+        'found': total_added,
+        'targets': all_new_targets,
         'results': results
     })
 
@@ -1092,27 +1597,15 @@ def discover_all_agents_targets():
 
 @app.route('/api/v1/targets', methods=['GET'])
 def list_targets():
-    """列出所有目标"""
-    with TARGETS_LOCK:
-        targets = list(SERVER_TARGETS)
+    """列出非 Agent 管理的目标（普通目标，agent_id 为空）"""
+    all_targets = db.get_targets()
     
-    # 补充 Agent 信息
-    config = load_config()
-    agents = {a.get('agent_id'): a for a in config.get('agents', [])}
-    
-    enriched_targets = []
-    for t in targets:
-        agent_id = t.get('agent_id')
-        agent = agents.get(agent_id, {})
-        enriched_targets.append({
-            **t,
-            'agent_name': agent.get('name', ''),
-            'agent_host': agent.get('host', '')
-        })
+    # ★ 只返回普通目标（agent_id 为空），Agent 目标在 /api/v1/agent-targets 中管理
+    targets = [t for t in all_targets if not t.get('agent_id')]
     
     return jsonify({
         'status': 'success',
-        'targets': enriched_targets
+        'targets': targets
     })
 
 
@@ -1125,34 +1618,22 @@ def add_target():
         return jsonify({'error': 'url is required'}), 400
     
     target = {
-        'id': data.get('id', str(time.time())),
+        'id': data.get('id', ''),
         'url': data.get('url'),
         'service_name': data.get('service_name', data.get('url')),
         'owner': data.get('owner', 'unknown'),
         'owner_email': data.get('owner_email', ''),
         'env': data.get('env', 'production'),
-        'agent_id': data.get('agent_id'),  # 可选，指定 Agent
+        'agent_id': data.get('agent_id', ''),
         'timeout': data.get('timeout', 10),
         'check_interval': data.get('check_interval', 180),
         'enabled': data.get('enabled', True),
         'created_at': datetime.now().isoformat()
     }
     
-    with TARGETS_LOCK:
-        global SERVER_TARGETS
-        # 检查是否已存在
-        for i, t in enumerate(SERVER_TARGETS):
-            if t.get('url') == target['url']:
-                SERVER_TARGETS[i] = target
-                save_targets_config()
-                # 触发 Exporter 重新加载
-                threading.Thread(target=trigger_exporter_reload, daemon=True).start()
-                return jsonify({'status': 'success', 'target': target})
-        
-        SERVER_TARGETS.append(target)
-        save_targets_config()
-        # 触发 Exporter 重新加载
-        threading.Thread(target=trigger_exporter_reload, daemon=True).start()
+    db.upsert_target(target)
+    save_targets_config()
+    threading.Thread(target=trigger_exporter_reload, daemon=True).start()
     
     logger.info(f"添加目标: {target['url']}")
     return jsonify({'status': 'success', 'target': target})
@@ -1163,44 +1644,36 @@ def update_target(target_id):
     """更新目标"""
     data = request.json or {}
     
-    with TARGETS_LOCK:
-        global SERVER_TARGETS
-        for i, t in enumerate(SERVER_TARGETS):
-            if t.get('id') == target_id:
-                SERVER_TARGETS[i] = {
-                    **t,
-                    'url': data.get('url', t.get('url')),
-                    'service_name': data.get('service_name', t.get('service_name')),
-                    'owner': data.get('owner', t.get('owner')),
-                    'owner_email': data.get('owner_email', t.get('owner_email')),
-                    'env': data.get('env', t.get('env')),
-                    'agent_id': data.get('agent_id', t.get('agent_id')),
-                    'timeout': data.get('timeout', t.get('timeout', 10)),
-                    'check_interval': data.get('check_interval', t.get('check_interval', 180)),
-                    'enabled': data.get('enabled', t.get('enabled', True))
-                }
-                save_targets_config()
-                # 触发 Exporter 重新加载
-                threading.Thread(target=trigger_exporter_reload, daemon=True).start()
-                return jsonify({'status': 'success', 'target': SERVER_TARGETS[i]})
+    existing = db.get_target(target_id)
+    if not existing:
+        return jsonify({'error': 'Target not found'}), 404
     
-    return jsonify({'error': 'Target not found'}), 404
+    updated = {
+        **existing,
+        'url': data.get('url', existing.get('url')),
+        'service_name': data.get('service_name', existing.get('service_name')),
+        'owner': data.get('owner', existing.get('owner')),
+        'owner_email': data.get('owner_email', existing.get('owner_email')),
+        'env': data.get('env', existing.get('env')),
+        'agent_id': data.get('agent_id', existing.get('agent_id')),
+        'timeout': data.get('timeout', existing.get('timeout', 10)),
+        'check_interval': data.get('check_interval', existing.get('check_interval', 180)),
+        'enabled': data.get('enabled', existing.get('enabled', True))
+    }
+    db.upsert_target(updated)
+    save_targets_config()
+    threading.Thread(target=trigger_exporter_reload, daemon=True).start()
+    return jsonify({'status': 'success', 'target': updated})
 
 
 @app.route('/api/v1/targets/<target_id>', methods=['DELETE'])
 def delete_target(target_id):
     """删除目标"""
-    with TARGETS_LOCK:
-        global SERVER_TARGETS
-        original_len = len(SERVER_TARGETS)
-        SERVER_TARGETS = [t for t in SERVER_TARGETS if t.get('id') != target_id]
-        
-        if len(SERVER_TARGETS) < original_len:
-            save_targets_config()
-            # 触发 Exporter 重新加载
-            threading.Thread(target=trigger_exporter_reload, daemon=True).start()
-            logger.info(f"删除目标: {target_id}")
-            return jsonify({'status': 'success'})
+    if db.delete_target(target_id):
+        save_targets_config()
+        threading.Thread(target=trigger_exporter_reload, daemon=True).start()
+        logger.info(f"删除目标: {target_id}")
+        return jsonify({'status': 'success'})
     
     return jsonify({'error': 'Target not found'}), 404
 
@@ -1226,12 +1699,13 @@ def get_agent_targets():
     # 找到请求的 Agent 配置
     request_agent = None
     for a in agents:
-        if a.get('agent_id') == agent_id or a.get('host') == ip or hostname in str(a.get('name', '')):
+        if a.get('agent_id') == agent_id or \
+           (ip and a.get('host') == ip) or \
+           (hostname and hostname in str(a.get('name', ''))):
             request_agent = a
             break
     
-    with TARGETS_LOCK:
-        targets = list(SERVER_TARGETS)
+    targets = db.get_targets()
     
     # 筛选分配给该 Agent 或未分配的目标
     assigned_targets = []
@@ -1239,23 +1713,27 @@ def get_agent_targets():
         if not t.get('enabled', True):
             continue
         
-        target_agent_id = t.get('agent_id')
+        target_agent_id = t.get('agent_id', '')
         
-        # 精确匹配 agent_id（支持多种格式）
+        # 精确匹配 agent_id
         if target_agent_id == agent_id:
             assigned_targets.append(t)
-        # 根据请求 Agent 的配置匹配
-        elif request_agent:
-            # 如果目标的 agent_id 等于 Agent 的 host 或 IP
-            if str(target_agent_id) == str(request_agent.get('host')) or \
-               str(target_agent_id) == str(request_agent.get('agent_id')):
-                assigned_targets.append(t)
-            # 如果目标的 agent_id 等于 Agent 的名称
-            elif str(target_agent_id) and str(target_agent_id) in str(request_agent.get('name', '')):
-                assigned_targets.append(t)
-        # 未分配的目标，可以被任何 Agent 获取
-        elif not target_agent_id:
+            continue
+        
+        # 未分配的目标，可被任何 Agent 获取
+        if not target_agent_id:
             assigned_targets.append(t)
+            continue
+        
+        # 根据请求 Agent 的配置匹配（向后兼容旧格式）
+        if request_agent:
+            req_host = str(request_agent.get('host', ''))
+            req_agent_id = str(request_agent.get('agent_id', ''))
+            req_name = str(request_agent.get('name', ''))
+            if target_agent_id == req_host or \
+               target_agent_id == req_agent_id or \
+               (target_agent_id and target_agent_id in req_name):
+                assigned_targets.append(t)
     
     logger.info(f"Agent [{agent_id or hostname}] (IP: {ip}) 请求目标配置，返回 {len(assigned_targets)} 个")
     
@@ -1263,6 +1741,130 @@ def get_agent_targets():
         'status': 'success',
         'targets': assigned_targets,
         'agent_id': agent_id or hostname
+    })
+
+
+# ========== Agent 推送模式 API ==========
+
+@app.route('/api/v1/agents/<agent_id>/metrics', methods=['POST'])
+def receive_agent_metrics(agent_id):
+    """
+    接收 Agent 主动推送的指标数据
+    推送模式下，Agent 检测完成后主动将指标推送到此端点
+    """
+    data = request.json or {}
+    
+    # 验证 agent_id 一致性
+    payload_agent_id = data.get('agent_id', '')
+    if payload_agent_id and payload_agent_id != agent_id:
+        logger.warning(f"Agent ID 不匹配: URL={agent_id}, payload={payload_agent_id}")
+    
+    agent_info = data.get('agent_info', {})
+    metrics = data.get('metrics', [])
+    
+    if not metrics:
+        return jsonify({'status': 'success', 'message': 'No metrics to process', 'received': 0})
+    
+    # 为每个指标添加 agent 信息和来源标记
+    enriched_metrics = []
+    seen_keys = set()  # 用于去重
+    
+    for m in metrics:
+        # 去重：按 hostname:port:metric_type:timestamp 判断
+        dedup_key = f"{m.get('hostname', '')}:{m.get('port', '')}:{m.get('metric_type', '')}:{m.get('timestamp', '')}"
+        if dedup_key in seen_keys:
+            continue
+        seen_keys.add(dedup_key)
+        
+        m['agent_id'] = agent_id
+        m['agent_name'] = agent_info.get('hostname', agent_id)
+        m['agent_hostname'] = agent_info.get('hostname', '')
+        m['scraped_at'] = datetime.now().isoformat()
+        m['source'] = 'agent_push'  # 标记数据来源为 Agent 推送
+        enriched_metrics.append(m)
+    
+    # 添加到指标缓存
+    with METRICS_LOCK:
+        METRICS_BUFFER.extend(enriched_metrics)
+        # 限制缓存大小
+        if len(METRICS_BUFFER) > MAX_METRICS_BUFFER:
+            METRICS_BUFFER[:] = METRICS_BUFFER[-MAX_METRICS_BUFFER:]
+    
+    # 异步保存到文件
+    threading.Thread(target=_save_metrics_async, args=(enriched_metrics,), daemon=True).start()
+    
+    # 更新心跳（推送指标也视为心跳）
+    agent_mode = data.get('agent_mode', 'push')
+    db.update_heartbeat(agent_id, {
+        'agent_info': agent_info,
+        'targets_count': len(metrics),
+        'push_mode': agent_mode in ('push', 'dual'),
+        'agent_mode': agent_mode,
+    })
+    
+    logger.info(f"接收 Agent [{agent_id}] 推送 {len(enriched_metrics)} 条指标 (去重后)")
+    
+    return jsonify({
+        'status': 'success',
+        'message': f'Received {len(enriched_metrics)} metrics',
+        'received': len(enriched_metrics)
+    })
+
+
+@app.route('/api/v1/agents/<agent_id>/heartbeat', methods=['POST'])
+def receive_agent_heartbeat(agent_id):
+    """
+    接收 Agent 心跳
+    用于判断 Agent 在线状态
+    """
+    data = request.json or {}
+    
+    payload_agent_id = data.get('agent_id', '')
+    if payload_agent_id and payload_agent_id != agent_id:
+        logger.warning(f"心跳 Agent ID 不匹配: URL={agent_id}, payload={payload_agent_id}")
+    
+    agent_info = data.get('agent_info', {})
+    targets_count = data.get('targets_count', 0)
+    metrics_buffer_size = data.get('metrics_buffer_size', 0)
+    push_queue_size = data.get('push_queue_size', 0)
+    agent_config = data.get('config', {})
+    local_targets = data.get('local_targets', [])
+    
+    # 更新心跳记录到数据库
+    db.update_heartbeat(agent_id, {
+        'agent_info': agent_info,
+        'targets_count': targets_count,
+        'metrics_buffer_size': metrics_buffer_size,
+        'push_queue_size': push_queue_size,
+        'push_mode': agent_config.get('push_mode', True),
+        'agent_mode': agent_config.get('agent_mode', 'push' if agent_config.get('push_mode', True) else 'pull'),
+        'scrape_interval': agent_config.get('scrape_interval', 180),
+        'local_targets': local_targets,
+    })
+    
+    # 如果 Agent 不在配置列表中，自动注册
+    existing_agent = db.get_agent(agent_id)
+    if not existing_agent and agent_info:
+        # 自动注册 Agent
+        agent_mode = agent_config.get('agent_mode', 'push')
+        new_agent = {
+            'agent_id': agent_id,
+            'host': agent_info.get('ip', ''),
+            'port': 0 if agent_mode == 'push' else 8091,  # push 模式不需要端口
+            'name': agent_info.get('hostname', agent_id),
+            'enabled': True,
+            'push_mode': agent_mode in ('push', 'dual'),
+            'agent_mode': agent_mode,
+            'auto_registered': True
+        }
+        db.upsert_agent(new_agent)
+        logger.info(f"自动注册推送模式 Agent: {agent_id} ({agent_info.get('hostname', '')})")
+    
+    logger.debug(f"接收 Agent [{agent_id}] 心跳, 目标: {targets_count}, 指标缓存: {metrics_buffer_size}")
+    
+    return jsonify({
+        'status': 'success',
+        'message': 'Heartbeat received'
     })
 
 
@@ -1347,7 +1949,29 @@ def prometheus_metrics():
     for m in metrics_by_type.get('ssl_cert_serial', []):
         labels = _build_labels(m, detail_label_keys + ['serial'])
         output_lines.append(f'ssl_cert_serial{{{labels}}} {m.get("value", 0)}')
-    
+
+    # ========== 凭证管理指标 ==========
+    output_lines.append('# HELP credential_days_left Days left until credential expiry')
+    output_lines.append('# TYPE credential_days_left gauge')
+
+    cred_label_keys = ['credential_name', 'credential_type', 'owner', 'owner_email', 'service_name', 'env']
+
+    credentials = db.get_credentials(enabled_only=True)
+    for cred in credentials:
+        if not cred.get('expiry_date'):
+            continue
+        info = compute_credential_status(cred['expiry_date'])
+        cred_metric = {
+            'credential_name': cred.get('name', ''),
+            'credential_type': cred.get('type', ''),
+            'owner': cred.get('owner', ''),
+            'owner_email': cred.get('owner_email', ''),
+            'service_name': cred.get('service_name', ''),
+            'env': cred.get('env', ''),
+        }
+        labels = _build_labels(cred_metric, cred_label_keys)
+        output_lines.append(f'credential_days_left{{{labels}}} {info["days_left"]}')
+
     return '\n'.join(output_lines) + '\n', 200, {'Content-Type': 'text/plain; charset=utf-8'}
 
 
@@ -1929,11 +2553,10 @@ def list_agent_targets():
     agent_host = request.args.get('agent_host', '')
     agent_id_filter = request.args.get('agent_id', '')
     
-    with TARGETS_LOCK:
-        targets = list(SERVER_TARGETS)
+    all_targets = db.get_targets()
     
     # 过滤掉没有 agent_id 的目标（这些是 Server 直接监控的）
-    agent_targets = [t for t in targets if t.get('agent_id')]
+    agent_targets = [t for t in all_targets if t.get('agent_id')]
     
     # 如果指定了 Agent host 进行过滤
     if agent_host:
@@ -1982,13 +2605,12 @@ def get_agent_target(target_id):
     """获取单个 Agent 目标"""
     agent_id = request.args.get('agent_id', '')
     
-    with TARGETS_LOCK:
-        for t in SERVER_TARGETS:
-            if t.get('id') == target_id and t.get('agent_id') == agent_id:
-                return jsonify({
-                    'status': 'success',
-                    'target': t
-                })
+    target = db.get_target(target_id)
+    if target and (not agent_id or target.get('agent_id') == agent_id):
+        return jsonify({
+            'status': 'success',
+            'target': target
+        })
     
     return jsonify({'error': 'Target not found'}), 404
 
@@ -2049,17 +2671,8 @@ def add_agent_target():
         'created_at': datetime.now().isoformat()
     }
     
-    with TARGETS_LOCK:
-        global SERVER_TARGETS
-        # 检查是否已存在（根据 URL 和 Agent ID）
-        for i, t in enumerate(SERVER_TARGETS):
-            if t.get('url') == target['url'] and t.get('agent_id') == target_agent_id:
-                SERVER_TARGETS[i] = target
-                save_targets_config()
-                return jsonify({'status': 'success', 'target': target})
-        
-        SERVER_TARGETS.append(target)
-        save_targets_config()
+    db.upsert_target(target)
+    save_targets_config()
     
     logger.info(f"添加 Agent 目标: {target['url']} -> {agent.get('name')} ({target_agent_id})")
     return jsonify({'status': 'success', 'target': target})
@@ -2070,38 +2683,60 @@ def update_agent_target(target_id):
     """更新 Agent 目标"""
     data = request.json or {}
     
-    with TARGETS_LOCK:
-        global SERVER_TARGETS
+    # 如果指定了 agent_id，需要先验证 Agent 存在
+    new_agent_id = data.get('agent_id')
+    if new_agent_id:
+        config = load_config()
+        agent = None
+        for a in config.get('agents', []):
+            if a.get('agent_id') == new_agent_id or a.get('host') == new_agent_id:
+                agent = a
+                break
+        if not agent:
+            return jsonify({'error': f'Agent not found: {new_agent_id}'}), 404
+        new_agent_id = agent.get('agent_id')  # 使用正确的 agent_id
         
-        # 如果指定了 agent_id，需要先验证 Agent 存在
-        new_agent_id = data.get('agent_id')
-        if new_agent_id:
-            config = load_config()
-            agent = None
-            for a in config.get('agents', []):
-                if a.get('agent_id') == new_agent_id or a.get('host') == new_agent_id:
-                    agent = a
-                    break
-            if not agent:
-                return jsonify({'error': f'Agent not found: {new_agent_id}'}), 404
-            new_agent_id = agent.get('agent_id')  # 使用正确的 agent_id
-        
-        for i, t in enumerate(SERVER_TARGETS):
-            if t.get('id') == target_id:
-                SERVER_TARGETS[i] = {
-                    **t,
-                    'url': data.get('url', t.get('url')),
-                    'service_name': data.get('service_name', t.get('service_name')),
-                    'owner': data.get('owner', t.get('owner', '')),
-                    'owner_email': data.get('owner_email', t.get('owner_email', '')),
-                    'env': data.get('env', t.get('env', 'production')),
-                    'agent_id': new_agent_id if new_agent_id else t.get('agent_id'),
-                    'timeout': data.get('timeout', t.get('timeout', 30)),
-                    'check_interval': data.get('check_interval', t.get('check_interval', 180)),
-                    'enabled': data.get('enabled', t.get('enabled', True))
-                }
-                save_targets_config()
-                return jsonify({'status': 'success', 'target': SERVER_TARGETS[i]})
+    existing = db.get_target(target_id)
+    if not existing:
+        return jsonify({'error': 'Target not found'}), 404
+    
+    old_url = existing.get('url', '')
+    new_url_value = data.get('url', existing.get('url'))
+    
+    updated = {
+        **existing,
+        'url': new_url_value,
+        'service_name': data.get('service_name', existing.get('service_name')),
+        'owner': data.get('owner', existing.get('owner', '')),
+        'owner_email': data.get('owner_email', existing.get('owner_email', '')),
+        'env': data.get('env', existing.get('env', 'production')),
+        'agent_id': new_agent_id if new_agent_id else existing.get('agent_id'),
+        'timeout': data.get('timeout', existing.get('timeout', 30)),
+        'check_interval': data.get('check_interval', existing.get('check_interval', 180)),
+        'enabled': data.get('enabled', existing.get('enabled', True))
+    }
+    db.upsert_target(updated)
+    save_targets_config()
+    
+    # 如果 URL 发生变化或被禁用，清理关联的证书指标数据
+    should_clean = False
+    clean_target = dict(existing)
+    
+    if old_url != new_url_value:
+        # URL 变更：清理旧 URL 的指标
+        clean_target['url'] = old_url
+        should_clean = True
+    
+    new_enabled = data.get('enabled')
+    if new_enabled is not None and not new_enabled and existing.get('enabled', True):
+        # 目标被禁用：清理指标
+        clean_target['url'] = new_url_value
+        should_clean = True
+    
+    if should_clean:
+        _clean_metrics_for_target(clean_target)
+    
+    return jsonify({'status': 'success', 'target': updated})
     
     return jsonify({'error': 'Target not found'}), 404
 
@@ -2111,17 +2746,249 @@ def delete_agent_target(target_id):
     """删除 Agent 目标"""
     agent_id = request.args.get('agent_id', '')
     
-    with TARGETS_LOCK:
-        global SERVER_TARGETS
-        original_len = len(SERVER_TARGETS)
-        SERVER_TARGETS = [t for t in SERVER_TARGETS if not (t.get('id') == target_id and t.get('agent_id') == agent_id)]
-        
-        if len(SERVER_TARGETS) < original_len:
-            save_targets_config()
-            logger.info(f"删除 Agent 目标: {target_id}")
-            return jsonify({'status': 'success'})
+    target = db.get_target(target_id)
+    if target:
+        if agent_id and target.get('agent_id') != agent_id:
+            return jsonify({'error': 'Target not found'}), 404
+        db.delete_target(target_id)
+        save_targets_config()
+        # 清理关联的证书指标数据（内存 + 数据库）
+        _clean_metrics_for_target(target)
+        logger.info(f"删除 Agent 目标: {target_id} (agent_id={agent_id or 'any'})")
+        return jsonify({'status': 'success'})
     
     return jsonify({'error': 'Target not found'}), 404
+
+
+# ========== 凭证管理 API ==========
+
+CREDENTIAL_TYPE_LABELS = {
+    'cert': 'SSL证书',
+    'key': '密钥',
+    'auth': '授权',
+    'password': '口令/密码',
+}
+
+
+@app.route('/api/v1/credentials', methods=['GET'])
+def list_credentials():
+    """列出所有凭证，支持筛选"""
+    cred_type = request.args.get('type', '')
+    status = request.args.get('status', '')
+    keyword = request.args.get('keyword', '')
+    
+    result = db.get_credentials()
+    
+    # 计算状态
+    enriched = []
+    for cred in result:
+        info = compute_credential_status(cred.get('expiry_date', ''))
+        enriched_cred = dict(cred)
+        enriched_cred['status'] = info['status']
+        enriched_cred['days_left'] = info['days_left']
+        enriched_cred['level'] = info['level']
+        enriched.append(enriched_cred)
+    
+    # 筛选
+    if cred_type:
+        enriched = [c for c in enriched if c.get('type') == cred_type]
+    if status:
+        enriched = [c for c in enriched if c.get('status') == status]
+    if keyword:
+        kw = keyword.lower()
+        enriched = [c for c in enriched if kw in c.get('name', '').lower() or kw in c.get('owner', '').lower() or kw in c.get('remark', '').lower()]
+    
+    # 统计
+    stats = {
+        'total': len(enriched),
+        'expired': len([c for c in enriched if c.get('status') == 'expired']),
+        'critical': len([c for c in enriched if c.get('status') == 'critical']),
+        'warning': len([c for c in enriched if c.get('status') == 'warning']),
+        'normal': len([c for c in enriched if c.get('status') == 'normal']),
+        'unknown': len([c for c in enriched if c.get('status') == 'unknown']),
+    }
+    
+    return jsonify({
+        'status': 'success',
+        'credentials': enriched,
+        'stats': stats,
+    })
+
+
+@app.route('/api/v1/credentials', methods=['POST'])
+def add_credential():
+    """添加凭证"""
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': 'No data provided'}), 400
+    
+    name = data.get('name', '').strip()
+    cred_type = data.get('type', '').strip()
+    expiry_date = data.get('expiry_date', '').strip()
+    
+    if not name:
+        return jsonify({'error': '凭证名称不能为空'}), 400
+    if cred_type not in CREDENTIAL_TYPE_LABELS:
+        return jsonify({'error': f'凭证类型无效，可选: {", ".join(CREDENTIAL_TYPE_LABELS.keys())}'}), 400
+    
+    credential = {
+        'id': data.get('id') or '',
+        'name': name,
+        'type': cred_type,
+        'type_label': CREDENTIAL_TYPE_LABELS.get(cred_type, cred_type),
+        'expiry_date': expiry_date,
+        'owner': data.get('owner', '').strip(),
+        'owner_email': data.get('owner_email', '').strip(),
+        'env': data.get('env', 'production'),
+        'service_name': data.get('service_name', '').strip(),
+        'remark': data.get('remark', '').strip(),
+        'enabled': data.get('enabled', True),
+        'notify_days': data.get('notify_days', CREDENTIAL_WARN_DAYS),
+    }
+    
+    db.upsert_credential(credential)
+    
+    info = compute_credential_status(expiry_date)
+    credential['status'] = info['status']
+    credential['days_left'] = info['days_left']
+    credential['level'] = info['level']
+    
+    logger.info(f"添加凭证: {name} ({cred_type}), 过期日期: {expiry_date}")
+    return jsonify({'status': 'success', 'credential': credential}), 201
+
+
+@app.route('/api/v1/credentials/<cred_id>', methods=['GET'])
+def get_credential(cred_id):
+    """获取单个凭证"""
+    cred = db.get_credential(cred_id)
+    if not cred:
+        return jsonify({'error': 'Credential not found'}), 404
+    
+    result = dict(cred)
+    info = compute_credential_status(cred.get('expiry_date', ''))
+    result['status'] = info['status']
+    result['days_left'] = info['days_left']
+    result['level'] = info['level']
+    return jsonify({'status': 'success', 'credential': result})
+
+
+@app.route('/api/v1/credentials/<cred_id>', methods=['PUT'])
+def update_credential(cred_id):
+    """更新凭证"""
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': 'No data provided'}), 400
+    
+    existing = db.get_credential(cred_id)
+    if not existing:
+        return jsonify({'error': 'Credential not found'}), 404
+    
+    if 'type' in data and data['type'] not in CREDENTIAL_TYPE_LABELS:
+        return jsonify({'error': '凭证类型无效'}), 400
+    
+    updated = dict(existing)
+    if 'name' in data:
+        updated['name'] = data['name'].strip()
+    if 'type' in data:
+        updated['type'] = data['type']
+        updated['type_label'] = CREDENTIAL_TYPE_LABELS.get(data['type'], data['type'])
+    if 'expiry_date' in data:
+        updated['expiry_date'] = data['expiry_date'].strip()
+    if 'owner' in data:
+        updated['owner'] = data['owner'].strip()
+    if 'owner_email' in data:
+        updated['owner_email'] = data['owner_email'].strip()
+    if 'env' in data:
+        updated['env'] = data['env']
+    if 'service_name' in data:
+        updated['service_name'] = data['service_name'].strip()
+    if 'remark' in data:
+        updated['remark'] = data['remark'].strip()
+    if 'enabled' in data:
+        updated['enabled'] = data['enabled']
+    if 'notify_days' in data:
+        updated['notify_days'] = data['notify_days']
+    
+    db.upsert_credential(updated)
+    
+    result = dict(updated)
+    info = compute_credential_status(updated.get('expiry_date', ''))
+    result['status'] = info['status']
+    result['days_left'] = info['days_left']
+    result['level'] = info['level']
+    
+    logger.info(f"更新凭证: {updated.get('name')} ({cred_id})")
+    return jsonify({'status': 'success', 'credential': result})
+
+
+@app.route('/api/v1/credentials/<cred_id>', methods=['DELETE'])
+def delete_credential(cred_id):
+    """删除凭证"""
+    if db.delete_credential(cred_id):
+        logger.info(f"删除凭证: {cred_id}")
+        return jsonify({'status': 'success'})
+    
+    return jsonify({'error': 'Credential not found'}), 404
+
+
+@app.route('/api/v1/credentials/check', methods=['POST'])
+def check_credentials_now():
+    """立即检查凭证过期状态"""
+    credentials = db.get_credentials(enabled_only=True)
+    alerts = []
+    for cred in credentials:
+        if not cred.get('expiry_date'):
+            continue
+        info = compute_credential_status(cred['expiry_date'])
+        if info['status'] in ('critical', 'expired', 'warning'):
+            alerts.append({
+                'name': cred.get('name', ''),
+                'type': cred.get('type', ''),
+                'expiry_date': cred.get('expiry_date', ''),
+                'days_left': info['days_left'],
+                'level': info['level'],
+                'owner': cred.get('owner', ''),
+                'owner_email': cred.get('owner_email', ''),
+            })
+    
+    if alerts:
+        if CREDENTIAL_ALERT_WEBHOOK:
+            try:
+                send_feishu_credential_alert(alerts)
+            except Exception as e:
+                logger.error(f"手动触发飞书告警失败: {e}")
+        if CREDENTIAL_ALERT_EMAILS:
+            try:
+                send_email_credential_alert(alerts)
+            except Exception as e:
+                logger.error(f"手动触发邮件告警失败: {e}")
+    
+    return jsonify({
+        'status': 'success',
+        'alerts_count': len(alerts),
+        'alerts': alerts,
+    })
+
+
+@app.route('/api/v1/credentials/stats', methods=['GET'])
+def get_credentials_stats():
+    """获取凭证统计信息"""
+    creds = db.get_credentials()
+    
+    stats = {
+        'total': len(creds),
+        'by_type': {},
+        'by_status': {'expired': 0, 'critical': 0, 'warning': 0, 'normal': 0, 'unknown': 0},
+    }
+    
+    for cred in creds:
+        ctype = cred.get('type', 'unknown')
+        stats['by_type'][ctype] = stats['by_type'].get(ctype, 0) + 1
+        
+        info = compute_credential_status(cred.get('expiry_date', ''))
+        stats['by_status'][info['status']] = stats['by_status'].get(info['status'], 0) + 1
+    
+    return jsonify({'status': 'success', 'stats': stats})
 
 
 if __name__ == '__main__':
@@ -2131,9 +2998,13 @@ if __name__ == '__main__':
     print("=" * 60)
     print("SSL Certificate Server")
     print("=" * 60)
-    print("模式: Server 主动拉取 Agent 数据")
-    print(f"配置路径: {CONFIG_PATH}")
-    print(f"数据路径: {DATA_PATH}")
+    print("模式: Agent 推送（推荐） + Agent 拉取（兼容） + 直接检测")
+    print(f"数据库: {db.DB_HOST}:{db.DB_PORT}/{db.DB_NAME}")
+    print(f"心跳超时: {HEARTBEAT_TIMEOUT} 秒")
+    
+    # 初始化数据库
+    db.init_db()
+    print("数据库初始化完成")
     
     # SSL/HTTPS 配置
     HTTPS_PORT = int(os.getenv('SERVER_HTTPS_PORT', '8092'))  # HTTPS 专用端口
@@ -2153,6 +3024,23 @@ if __name__ == '__main__':
     scrape_thread = threading.Thread(target=_scrape_loop, daemon=True)
     scrape_thread.start()
     
+    # 启动定时指标清理线程
+    def _metrics_cleanup_loop():
+        while True:
+            time.sleep(3600)  # 每小时清理一次
+            try:
+                db.cleanup_old_metrics()
+            except Exception as e:
+                logger.error(f"指标清理失败: {e}")
+    
+    cleanup_thread = threading.Thread(target=_metrics_cleanup_loop, daemon=True)
+    cleanup_thread.start()
+    
+    # 加载凭证配置并启动过期检查线程
+    credential_check_thread = threading.Thread(target=check_credential_expiry, daemon=True)
+    credential_check_thread.start()
+    print(f"凭证过期检查线程已启动 (间隔: {CREDENTIAL_ALERT_CHECK_INTERVAL}s, 预警: ≤{CREDENTIAL_WARN_DAYS}天, 高危: ≤{CREDENTIAL_CRIT_DAYS}天)")
+    
     # Server 监听配置
     listen_host = os.getenv('SERVER_LISTEN_HOST', '0.0.0.0')
     listen_port = int(os.getenv('SERVER_LISTEN_PORT', '8090'))
@@ -2160,17 +3048,26 @@ if __name__ == '__main__':
     print(f"HTTP 监听: {listen_host}:{listen_port} (nginx 代理使用)")
     print(f"HTTPS 监听: {listen_host}:{HTTPS_PORT} (Agent 通信使用)")
     print("API Endpoints:")
-    print("  - GET  /health              - 健康检查")
-    print("  - GET  /stats               - 统计信息")
-    print("  - GET  /metrics             - Prometheus 指标")
-    print("  - GET  /targets             - Agent 目标管理页面")
-    print("  - POST /api/v1/agents       - 添加 Agent")
-    print("  - GET  /api/v1/agents       - 列出 Agent")
-    print("  - GET  /api/v1/agent-targets - 列出 Agent 目标")
-    print("  - POST /api/v1/agent-targets - 添加 Agent 目标")
-    print("  - PUT  /api/v1/agent-targets - 更新 Agent 目标")
-    print("  - DELETE /api/v1/agent-targets - 删除 Agent 目标")
-    print("  - POST /api/v1/scrape       - 手动触发拉取")
+    print("  - GET  /health                              - 健康检查")
+    print("  - GET  /stats                               - 统计信息")
+    print("  - GET  /metrics                             - Prometheus 指标")
+    print("  - GET  /targets                             - Agent 目标管理页面")
+    print("  - POST /api/v1/agents                       - 添加 Agent")
+    print("  - GET  /api/v1/agents                       - 列出 Agent")
+    print("  - POST /api/v1/agents/<id>/metrics          - [推送] 接收 Agent 指标")
+    print("  - POST /api/v1/agents/<id>/heartbeat         - [推送] 接收 Agent 心跳")
+    print("  - GET  /api/v1/agents/targets               - Agent 拉取目标配置")
+    print("  - GET  /api/v1/agent-targets                - 列出 Agent 目标")
+    print("  - POST /api/v1/agent-targets                - 添加 Agent 目标")
+    print("  - PUT  /api/v1/agent-targets                - 更新 Agent 目标")
+    print("  - DELETE /api/v1/agent-targets              - 删除 Agent 目标")
+    print("  - POST /api/v1/scrape                       - 手动触发拉取")
+    print("  - GET  /api/v1/credentials                  - 列出凭证")
+    print("  - POST /api/v1/credentials                  - 添加凭证")
+    print("  - PUT  /api/v1/credentials/<id>              - 更新凭证")
+    print("  - DELETE /api/v1/credentials/<id>            - 删除凭证")
+    print("  - POST /api/v1/credentials/check            - 立即检查过期")
+    print("  - GET  /api/v1/credentials/stats            - 凭证统计")
     print("=" * 60)
     
     # 根据是否启用 HTTPS 配置 SSL

@@ -5,6 +5,16 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import * as XLSX from 'xlsx';
+import {
+  startScheduler,
+  restartScheduler,
+  getReportScheduleConfig,
+  setReportScheduleConfig,
+  executeReportSend,
+  getSmtpConfig,
+  getLastSendResult,
+  FREQUENCY_CRON_MAP,
+} from './reportScheduler.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -14,6 +24,9 @@ const PORT = process.env.CAPTCHA_PORT || 3001;
 
 // 配置文件路径
 const CONFIG_PATH = process.env.TARGETS_CONFIG_PATH || '/app/data/ssl_targets.json';
+
+// Agent Server 内部地址（用于代理目标管理请求到数据库）
+const AGENT_SERVER_URL = process.env.AGENT_SERVER_INTERNAL_URL || 'http://ssl-agent-server:8090';
 
 // 确保数据目录存在
 const DATA_DIR = path.dirname(CONFIG_PATH);
@@ -119,33 +132,37 @@ function readUsersConfig() {
   // 从环境变量读取管理员
   const adminUser = process.env.DASHBOARD_ADMIN_USER;
   const adminPass = process.env.DASHBOARD_ADMIN_PASSWORD;
-  
+
   // 从环境变量读取只读用户
   const readonlyUser = process.env.DASHBOARD_READONLY_USER;
   const readonlyPass = process.env.DASHBOARD_READONLY_PASSWORD;
-  
+
   const users = [];
-  
+
   if (adminUser && adminPass) {
     users.push({ username: adminUser, password: adminPass, role: 'admin' });
   }
-  
+
   if (readonlyUser && readonlyPass) {
     users.push({ username: readonlyUser, password: readonlyPass, role: 'readonly' });
   }
-  
+
   // 如果没有配置环境变量，从配置文件读取
   if (users.length === 0) {
     try {
-      const config = readConfig();
-      if (config.admin) {
-        users.push({ username: config.admin.username, password: config.admin.password, role: 'admin' });
+      // 同步降级读取 JSON 文件（admin 配置不需要从 DB 读取）
+      if (fs.existsSync(CONFIG_PATH)) {
+        const data = fs.readFileSync(CONFIG_PATH, 'utf-8');
+        const config = JSON.parse(data);
+        if (config.admin) {
+          users.push({ username: config.admin.username, password: config.admin.password, role: 'admin' });
+        }
       }
     } catch (error) {
       console.error('Error reading admin config:', error);
     }
   }
-  
+
   return users;
 }
 
@@ -174,7 +191,7 @@ app.post('/api/auth/login', (req, res) => {
 });
 
 // 获取用户配置（不包含密码）
-app.get('/api/auth/config', (req, res) => {
+app.get('/api/auth/config', async (req, res) => {
   const users = readUsersConfig();
   res.json({ 
     success: true, 
@@ -186,7 +203,7 @@ app.get('/api/auth/config', (req, res) => {
 });
 
 // 更新管理员密码（仅支持配置文件中的管理员）
-app.put('/api/auth/password', (req, res) => {
+app.put('/api/auth/password', async (req, res) => {
   const { oldPassword, newPassword, confirmPassword } = req.body;
   
   if (!oldPassword || !newPassword || !confirmPassword) {
@@ -207,7 +224,7 @@ app.put('/api/auth/password', (req, res) => {
   }
 
   try {
-    const config = readConfig();
+    const config = await readConfig();
     if (!config.admin) {
       return res.json({ success: false, message: '未找到管理员配置' });
     }
@@ -218,7 +235,7 @@ app.put('/api/auth/password', (req, res) => {
     
     config.admin.password = newPassword;
     
-    if (writeConfig(config)) {
+    if (await writeConfig(config)) {
       return res.json({ success: true, message: '密码修改成功' });
     } else {
       return res.status(500).json({ success: false, message: '保存配置失败' });
@@ -231,119 +248,82 @@ app.put('/api/auth/password', (req, res) => {
 
 // ==================== 目标管理 API ====================
 
-// 读取配置文件
-function readConfig() {
+// 读取配置 - 从 Agent Server API 获取（数据在 SQLite 中）
+async function readConfig() {
   try {
-    if (!fs.existsSync(CONFIG_PATH)) {
-      // 如果配置文件不存在，返回默认配置
+    const resp = await fetch(`${AGENT_SERVER_URL}/api/v1/targets`);
+    if (resp.ok) {
+      const data = await resp.json();
       return {
         version: "1.0",
         description: "SSL证书监控统一配置文件",
-        targets: [],
-        settings: {
-          default_check_interval: 180,
-          default_timeout: 30,
-          alert_days_warning: 30,
-          alert_days_critical: 7,
-          skip_verify_patterns: ["*.local", "localhost", "127.0.0.1", "0.0.0.0"]
-        }
+        targets: data.targets || [],
+        settings: {} // settings 由数据库管理
       };
     }
-    const data = fs.readFileSync(CONFIG_PATH, 'utf-8');
-    return JSON.parse(data);
+    console.error('Error reading config from Agent Server:', resp.status);
+    return { targets: [], settings: {} };
   } catch (error) {
-    console.error('Error reading config:', error);
+    console.error('Error reading config from Agent Server:', error);
+    // 降级：尝试从 JSON 文件读取
+    try {
+      if (fs.existsSync(CONFIG_PATH)) {
+        const data = fs.readFileSync(CONFIG_PATH, 'utf-8');
+        return JSON.parse(data);
+      }
+    } catch (e) {
+      console.error('Fallback JSON read also failed:', e);
+    }
     return { targets: [], settings: {} };
   }
 }
 
-// 写入配置文件
-function writeConfig(config) {
+// 写入配置 - 同步目标到 Agent Server API（写入 SQLite）
+async function writeConfig(config) {
   try {
-    fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf-8');
-    
-    // 自动同步到 prometheus_targets.json (所有启用的目标)
-    syncPrometheusTargets(config);
-    
-    // 自动同步到 agent_targets.json (只同步分配了 agent_id 的目标)
-    syncAgentTargets(config);
-    
+    // 同步每个目标到 Agent Server
+    for (const target of config.targets) {
+      await fetch(`${AGENT_SERVER_URL}/api/v1/targets`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(target)
+      });
+    }
     return true;
   } catch (error) {
-    console.error('Error writing config:', error);
+    console.error('Error writing config to Agent Server:', error);
     return false;
   }
 }
 
-// 同步目标到 Prometheus targets 文件
-function syncPrometheusTargets(config) {
-  try {
-    const prometheusTargets = config.targets
-      .filter(t => t.enabled)
-      .map(t => ({
-        targets: [t.url],
-        labels: {
-          service_name: t.service_name,
-          owner: t.owner,
-          env: t.env
-        }
-      }));
 
-    const prometheusTargetsPath = '/app/data/prometheus_targets.json';
-    fs.writeFileSync(prometheusTargetsPath, JSON.stringify(prometheusTargets, null, 2), 'utf-8');
-    console.log(`Synced ${prometheusTargets.length} targets to prometheus_targets.json`);
+// Synchronous config reading for non-async contexts (fallback to JSON file)
+function readConfigSync() {
+  try {
+    if (fs.existsSync(CONFIG_PATH)) {
+      const data = fs.readFileSync(CONFIG_PATH, 'utf-8');
+      return JSON.parse(data);
+    }
   } catch (error) {
-    console.error('Error syncing to prometheus_targets.json:', error);
+    console.error('Error reading config (sync):', error);
   }
+  return { targets: [], settings: {} };
 }
 
-// 同步目标到 Agent targets 文件
+// 同步目标到 Prometheus targets 文件（由 agent-server 自动处理）
+function syncPrometheusTargets(config) {
+  // 不再需要手动同步，agent-server 的 save_targets_config() 会自动生成
+}
+
+// 同步目标到 Agent targets 文件（由 agent-server 自动处理）
 function syncAgentTargets(config) {
-  try {
-    const agentTargetsPath = '/app/data/agent_targets.json';
-    
-    // 读取现有的 agent_targets.json
-    let agentConfig = { targets: [] };
-    try {
-      if (fs.existsSync(agentTargetsPath)) {
-        agentConfig = JSON.parse(fs.readFileSync(agentTargetsPath, 'utf-8'));
-      }
-    } catch (e) {
-      console.log('Creating new agent_targets.json');
-    }
-    
-    // 将 ssl_targets.json 中有 agent_id 的目标同步到 agent_targets.json
-    const newAgentTargets = config.targets
-      .filter(t => t.enabled && t.agent_id)  // 只同步分配了 agent_id 的目标
-      .map(t => ({
-        id: t.id,
-        url: t.url,
-        service_name: t.service_name,
-        owner: t.owner,
-        owner_email: t.owner_email,
-        env: t.env,
-        agent_id: t.agent_id,
-        timeout: t.timeout || 10,
-        check_interval: t.check_interval || 180,
-        enabled: t.enabled,
-        created_at: t.created_at || new Date().toISOString()
-      }));
-    
-    // 合并：保留 agent_targets.json 中没有 agent_id 的目标（如内网直接添加的），添加新的
-    const existingWithoutAgent = agentConfig.targets.filter(t => !t.agent_id);
-    agentConfig.targets = [...existingWithoutAgent, ...newAgentTargets];
-    
-    fs.writeFileSync(agentTargetsPath, JSON.stringify(agentConfig, null, 2), 'utf-8');
-    console.log(`Synced ${newAgentTargets.length} targets to agent_targets.json`);
-  } catch (error) {
-    console.error('Error syncing to agent_targets.json:', error);
-  }
+  // 不再需要手动同步，agent-server 的 save_targets_config() 会自动生成
 }
 
 // 获取所有目标
-app.get('/api/targets', (req, res) => {
+app.get('/api/targets', async (req, res) => {
   try {
-    const config = readConfig();
+    const config = await readConfig();
     res.json({
       status: 'success',
       targets: config.targets || [],
@@ -355,7 +335,7 @@ app.get('/api/targets', (req, res) => {
 });
 
 // 添加新目标
-app.post('/api/targets', (req, res) => {
+app.post('/api/targets', async (req, res) => {
   try {
     const { url, service_name, owner, owner_email, env, enabled = true, check_interval, timeout, agent_id } = req.body;
     
@@ -390,7 +370,7 @@ app.post('/api/targets', (req, res) => {
       return res.status(400).json({ status: 'error', error: '请输入正确的邮箱格式' });
     }
 
-    const config = readConfig();
+    const config = await readConfig();
     
     // 检查URL是否已存在
     const exists = config.targets.some(t => t.url === url);
@@ -416,7 +396,7 @@ app.post('/api/targets', (req, res) => {
 
     config.targets.push(newTarget);
 
-    if (writeConfig(config)) {
+    if (await writeConfig(config)) {
       res.json({ status: 'success', message: '目标添加成功', target: newTarget });
     } else {
       res.status(500).json({ status: 'error', error: '保存配置失败' });
@@ -427,12 +407,12 @@ app.post('/api/targets', (req, res) => {
 });
 
 // 更新目标
-app.put('/api/targets/:id', (req, res) => {
+app.put('/api/targets/:id', async (req, res) => {
   try {
     const { id } = req.params;
     const updates = req.body;
     
-    const config = readConfig();
+    const config = await readConfig();
     const targetIndex = config.targets.findIndex(t => t.id === id);
     
     if (targetIndex === -1) {
@@ -484,7 +464,7 @@ app.put('/api/targets/:id', (req, res) => {
       id // 确保ID不变
     };
 
-    if (writeConfig(config)) {
+    if (await writeConfig(config)) {
       res.json({ status: 'success', message: '目标更新成功', target: config.targets[targetIndex] });
     } else {
       res.status(500).json({ status: 'error', error: '保存配置失败' });
@@ -495,11 +475,11 @@ app.put('/api/targets/:id', (req, res) => {
 });
 
 // 删除目标
-app.delete('/api/targets/:id', (req, res) => {
+app.delete('/api/targets/:id', async (req, res) => {
   try {
     const { id } = req.params;
     
-    const config = readConfig();
+    const config = await readConfig();
     const targetIndex = config.targets.findIndex(t => t.id === id);
     
     if (targetIndex === -1) {
@@ -508,7 +488,7 @@ app.delete('/api/targets/:id', (req, res) => {
 
     config.targets.splice(targetIndex, 1);
 
-    if (writeConfig(config)) {
+    if (await writeConfig(config)) {
       res.json({ status: 'success', message: '目标删除成功' });
     } else {
       res.status(500).json({ status: 'error', error: '保存配置失败' });
@@ -519,12 +499,12 @@ app.delete('/api/targets/:id', (req, res) => {
 });
 
 // 批量启用/禁用目标
-app.patch('/api/targets/:id/toggle', (req, res) => {
+app.patch('/api/targets/:id/toggle', async (req, res) => {
   try {
     const { id } = req.params;
     const { enabled } = req.body;
     
-    const config = readConfig();
+    const config = await readConfig();
     const target = config.targets.find(t => t.id === id);
     
     if (!target) {
@@ -533,7 +513,7 @@ app.patch('/api/targets/:id/toggle', (req, res) => {
 
     target.enabled = enabled;
 
-    if (writeConfig(config)) {
+    if (await writeConfig(config)) {
       res.json({ success: true, message: `目标已${enabled ? '启用' : '禁用'}`, data: target });
     } else {
       res.status(500).json({ success: false, message: '保存配置失败' });
@@ -544,13 +524,13 @@ app.patch('/api/targets/:id/toggle', (req, res) => {
 });
 
 // 重新加载配置（通知相关服务重新读取配置）
-app.post('/api/targets/reload', (req, res) => {
+app.post('/api/targets/reload', async (req, res) => {
   try {
     // 验证配置格式
-    const config = readConfig();
+    const config = await readConfig();
     
     // 手动触发同步到 prometheus_targets.json
-    syncPrometheusTargets(config);
+    await syncPrometheusTargets(config);
 
     res.json({ 
       success: true, 
@@ -684,10 +664,10 @@ function parseExcel(buffer) {
 }
 
 // 下载导入模板
-app.get('/api/targets/template', (req, res) => {
+app.get('/api/targets/template', async (req, res) => {
   try {
     const format = req.query.format || 'csv';
-    const config = readConfig();
+    const config = await readConfig();
     
     if (format === 'xlsx') {
       // 生成 Excel 模板
@@ -744,7 +724,7 @@ app.get('/api/targets/template', (req, res) => {
 });
 
 // 批量导入目标
-app.post('/api/targets/import', upload.single('file'), (req, res) => {
+app.post('/api/targets/import', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ success: false, message: '请上传文件' });
@@ -766,7 +746,7 @@ app.post('/api/targets/import', upload.single('file'), (req, res) => {
       return res.status(400).json({ success: false, message: '文件为空或格式不正确' });
     }
 
-    const config = readConfig();
+    const config = await readConfig();
     const errors = [];
     let successCount = 0;
     let failedCount = 0;
@@ -823,7 +803,7 @@ app.post('/api/targets/import', upload.single('file'), (req, res) => {
       successCount++;
     }
 
-    if (writeConfig(config)) {
+    if (await writeConfig(config)) {
       res.json({
         success: true,
         message: `导入完成`,
@@ -848,7 +828,7 @@ function generateSessionId() {
 }
 
 // 健康检查
-app.get('/health', (req, res) => {
+app.get('/health', async (req, res) => {
   res.json({ status: 'ok', timestamp: Date.now() });
 });
 
@@ -857,7 +837,7 @@ app.get('/health', (req, res) => {
 // 读取飞书配置
 function readLarkConfig() {
   try {
-    const config = readConfig();
+    const config = readConfigSync();
     return config.settings?.lark_webhook || null;
   } catch (error) {
     console.error('Error reading Lark config:', error);
@@ -962,7 +942,7 @@ app.post('/api/webhooks/lark', async (req, res) => {
 });
 
 // 获取飞书配置
-app.get('/api/webhooks/lark/config', (req, res) => {
+app.get('/api/webhooks/lark/config', async (req, res) => {
   const config = readLarkConfig();
   res.json({
     success: true,
@@ -974,7 +954,7 @@ app.get('/api/webhooks/lark/config', (req, res) => {
 });
 
 // 更新飞书配置
-app.put('/api/webhooks/lark/config', (req, res) => {
+app.put('/api/webhooks/lark/config', async (req, res) => {
   const { webhook_url, secret } = req.body;
 
   if (!webhook_url) {
@@ -982,13 +962,13 @@ app.put('/api/webhooks/lark/config', (req, res) => {
   }
 
   try {
-    const config = readConfig();
+    const config = await readConfig();
     if (!config.settings) {
       config.settings = {};
     }
     config.settings.lark_webhook = { webhook_url, secret: secret || '' };
 
-    if (writeConfig(config)) {
+    if (await writeConfig(config)) {
       res.json({ success: true, message: '飞书配置更新成功' });
     } else {
       res.status(500).json({ success: false, message: '保存配置失败' });
@@ -997,6 +977,228 @@ app.put('/api/webhooks/lark/config', (req, res) => {
     console.error('Error updating Lark config:', error);
     res.status(500).json({ success: false, message: '更新配置失败' });
   }
+});
+
+// ==================== 报告调度 API ====================
+
+// 获取报告调度配置
+app.get('/api/report-schedule', async (req, res) => {
+  try {
+    const config = getReportScheduleConfig();
+    const smtpConfig = getSmtpConfig();
+    const lastResult = getLastSendResult();
+    
+    res.json({
+      success: true,
+      data: {
+        ...config,
+        smtp_configured: !!(smtpConfig.host && smtpConfig.user && smtpConfig.password),
+        smtp_host: smtpConfig.host ? '***' + smtpConfig.host.slice(-10) : null,
+        smtp_port: smtpConfig.port || null,
+        smtp_from: smtpConfig.from ? '***' + smtpConfig.from.split('@')[0].slice(-3) + '@' + smtpConfig.from.split('@')[1] : null,
+        last_send_result: lastResult,
+        frequency_options: Object.keys(FREQUENCY_CRON_MAP).map(key => ({
+          value: key,
+          label: {
+            hourly: '每小时',
+            daily: '每天',
+            weekly: '每周',
+            monthly: '每月',
+            biweekly: '每半月',
+          }[key],
+          cron: FREQUENCY_CRON_MAP[key],
+        })),
+      },
+    });
+  } catch (error) {
+    console.error('Error getting report schedule config:', error);
+    res.status(500).json({ success: false, message: '获取报告配置失败' });
+  }
+});
+
+// 更新报告调度配置
+app.put('/api/report-schedule', async (req, res) => {
+  try {
+    const { enabled, frequency, cron_expression, admin_emails } = req.body;
+
+    // 验证频率
+    if (frequency && !FREQUENCY_CRON_MAP[frequency] && !cron_expression) {
+      return res.status(400).json({
+        success: false,
+        message: `不支持的频率: ${frequency}，可选值: ${Object.keys(FREQUENCY_CRON_MAP).join(', ')}`,
+      });
+    }
+
+    // 验证自定义 cron 表达式
+    if (cron_expression) {
+      const cronModule = (await import('node-cron')).default;
+      if (!cronModule.validate(cron_expression)) {
+        return res.status(400).json({
+          success: false,
+          message: `无效的 cron 表达式: ${cron_expression}`,
+        });
+      }
+    }
+
+    // 验证邮箱
+    if (admin_emails !== undefined) {
+      if (!Array.isArray(admin_emails)) {
+        return res.status(400).json({
+          success: false,
+          message: 'admin_emails 必须是数组',
+        });
+      }
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      const invalidEmails = admin_emails.filter(e => !emailRegex.test(e));
+      if (invalidEmails.length > 0) {
+        return res.status(400).json({
+          success: false,
+          message: `无效的邮箱地址: ${invalidEmails.join(', ')}`,
+        });
+      }
+    }
+
+    const updateData = {};
+    if (enabled !== undefined) updateData.enabled = enabled;
+    if (frequency) updateData.frequency = frequency;
+    if (cron_expression) updateData.cron_expression = cron_expression;
+    if (admin_emails !== undefined) updateData.admin_emails = admin_emails;
+
+    // 如果只有 frequency 没有 cron_expression，使用频率对应的 cron
+    if (frequency && !cron_expression) {
+      updateData.cron_expression = FREQUENCY_CRON_MAP[frequency];
+    }
+
+    const success = setReportScheduleConfig(updateData);
+    if (success) {
+      // 重启调度器
+      restartScheduler();
+      res.json({ success: true, message: '报告调度配置已更新' });
+    } else {
+      res.status(500).json({ success: false, message: '保存配置失败' });
+    }
+  } catch (error) {
+    console.error('Error updating report schedule config:', error);
+    res.status(500).json({ success: false, message: '更新报告配置失败' });
+  }
+});
+
+// 手动触发报告发送
+app.post('/api/report-schedule/send', async (req, res) => {
+  try {
+    const scheduleConfig = getReportScheduleConfig();
+
+    if (!scheduleConfig.admin_emails || scheduleConfig.admin_emails.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: '请先配置管理员邮箱',
+      });
+    }
+
+    const smtpConfig = getSmtpConfig();
+    if (!smtpConfig.host || !smtpConfig.user || !smtpConfig.password) {
+      return res.status(400).json({
+        success: false,
+        message: 'SMTP 配置不完整，请检查环境变量 SMTP_HOST, SMTP_USER, SMTP_PASSWORD',
+      });
+    }
+
+    // 异步执行发送，避免请求超时
+    executeReportSend().then(() => {
+      console.log('[API] 手动报告发送完成');
+    }).catch(err => {
+      console.error('[API] 手动报告发送失败:', err.message);
+    });
+
+    res.json({
+      success: true,
+      message: '报告发送已触发，请稍后查看发送结果',
+    });
+  } catch (error) {
+    console.error('Error triggering report send:', error);
+    res.status(500).json({ success: false, message: '触发报告发送失败' });
+  }
+});
+
+// 测试邮件发送
+app.post('/api/report-schedule/test', async (req, res) => {
+  try {
+    const { to } = req.body;
+
+    if (!to) {
+      return res.status(400).json({
+        success: false,
+        message: '请提供测试邮箱地址',
+      });
+    }
+
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(to)) {
+      return res.status(400).json({
+        success: false,
+        message: '无效的邮箱地址',
+      });
+    }
+
+    const smtpConfig = getSmtpConfig();
+    if (!smtpConfig.host || !smtpConfig.user || !smtpConfig.password) {
+      return res.status(400).json({
+        success: false,
+        message: 'SMTP 配置不完整，请检查环境变量 SMTP_HOST, SMTP_USER, SMTP_PASSWORD',
+      });
+    }
+
+    // 动态导入 nodemailer
+    const nodemailer = (await import('nodemailer')).default;
+    const transporter = nodemailer.createTransport({
+      host: smtpConfig.host,
+      port: smtpConfig.port,
+      secure: smtpConfig.port === 465,
+      auth: {
+        user: smtpConfig.user,
+        pass: smtpConfig.password,
+      },
+      tls: smtpConfig.useTLS ? { rejectUnauthorized: false } : undefined,
+    });
+
+    await transporter.sendMail({
+      from: smtpConfig.from || smtpConfig.user,
+      to,
+      subject: '📊 SSL证书监控系统 - 测试邮件',
+      html: `
+      <!DOCTYPE html>
+      <html><head><meta charset="UTF-8"></head>
+      <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; color: #333; padding: 20px;">
+        <div style="max-width: 600px; margin: 0 auto; background: white; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
+          <div style="background: linear-gradient(135deg, #0ea5e9, #6366f1); color: white; padding: 25px 30px;">
+            <h1 style="margin: 0 0 8px 0; font-size: 22px;">📊 SSL证书监控系统</h1>
+            <p style="margin: 0; opacity: 0.9; font-size: 14px;">测试邮件</p>
+          </div>
+          <div style="padding: 25px 30px;">
+            <p>如果您收到此邮件，说明 SSL 证书监控系统的邮件发送功能配置正确！</p>
+            <p style="color: #666; font-size: 14px;">发送时间: ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}</p>
+          </div>
+        </div>
+      </body></html>`,
+    });
+
+    res.json({ success: true, message: `测试邮件已发送至 ${to}` });
+  } catch (error) {
+    console.error('Error sending test email:', error);
+    res.status(500).json({
+      success: false,
+      message: `测试邮件发送失败: ${error.message}`,
+    });
+  }
+});
+
+// 获取最后一次发送结果
+app.get('/api/report-schedule/result', (req, res) => {
+  const result = getLastSendResult();
+  res.json({
+    success: true,
+    data: result,
+  });
 });
 
 app.listen(PORT, '0.0.0.0', () => {
@@ -1019,4 +1221,13 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log('  GET    /api/targets/template - 下载导入模板 (CSV/Excel)');
   console.log('  POST   /api/targets/import - 批量导入目标');
   console.log('  GET    /health - 健康检查');
+  console.log('  === 报告调度 ===');
+  console.log('  GET    /api/report-schedule - 获取报告调度配置');
+  console.log('  PUT    /api/report-schedule - 更新报告调度配置');
+  console.log('  POST   /api/report-schedule/send - 手动触发报告发送');
+  console.log('  POST   /api/report-schedule/test - 测试邮件发送');
+  console.log('  GET    /api/report-schedule/result - 获取最后一次发送结果');
+
+  // 启动定时报告调度器
+  startScheduler();
 });

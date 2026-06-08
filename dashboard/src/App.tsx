@@ -6,6 +6,8 @@ import Certificates from './pages/Certificates';
 import Alerts from './pages/Alerts';
 import Targets from './pages/Targets';
 import AgentTargets from './pages/AgentTargets';
+import CredentialManager from './pages/CredentialManager';
+import Settings from './pages/Settings';
 import Layout from './components/Layout';
 
 function PrivateRoute({ children }: { children: React.ReactNode }) {
@@ -44,6 +46,8 @@ function App() {
           <Route path="alerts" element={<Alerts />} />
           <Route path="targets" element={<AdminRoute><Targets /></AdminRoute>} />
           <Route path="agent-targets" element={<AdminRoute><AgentTargets /></AdminRoute>} />
+          <Route path="credential-manager" element={<AdminRoute><CredentialManager /></AdminRoute>} />
+          <Route path="settings" element={<AdminRoute><Settings /></AdminRoute>} />
         </Route>
       </Routes>
     </BrowserRouter>

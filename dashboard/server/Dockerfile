@@ -6,7 +6,7 @@ COPY package*.json ./
 
 RUN npm install
 
-COPY server.js .
+COPY server.js reportScheduler.js ./
 
 EXPOSE 3001
 

@@ -14,9 +14,28 @@ route:
   group_interval: 10s
   repeat_interval: 12h
   receiver: 'all-notifications'
+  routes:
+    # 凭证管理告警路由 - 单独分组
+    - match:
+        alert_type: credential
+      group_by: ['alertname', 'severity', 'owner']
+      group_wait: 10s
+      group_interval: 5m
+      repeat_interval: 6h
+      receiver: 'credential-notifications'
 
 receivers:
   - name: 'all-notifications'
+    email_configs:
+      - to: '${ALERT_EMAIL_TO}'
+        send_resolved: true
+    webhook_configs:
+      - url: 'http://feishu-webhook:8080/webhook'
+        send_resolved: true
+      - url: 'http://email-webhook:8080/webhook'
+        send_resolved: true
+
+  - name: 'credential-notifications'
     email_configs:
       - to: '${ALERT_EMAIL_TO}'
         send_resolved: true

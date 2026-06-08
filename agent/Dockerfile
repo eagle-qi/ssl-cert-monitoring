@@ -1,7 +1,7 @@
 FROM python:3.11-slim
 
 LABEL maintainer="SSL Cert Monitoring"
-LABEL description="SSL Certificate Agent for internal network monitoring"
+LABEL description="SSL Certificate Agent for internal network monitoring (Push/Pull/Dual Mode)"
 
 WORKDIR /app
 
@@ -22,12 +22,19 @@ COPY ssl_cert_agent.py .
 # 创建数据目录
 RUN mkdir -p /app/data
 
-# 暴露端口
+# 拉取/双模式暴露端口，推送模式不需要
 EXPOSE 8091
 
-# 健康检查
+# 健康检查 - 自适应模式
+# push 模式: 检查进程是否存活（无 HTTP 端口）
+# pull/dual 模式: 检查 HTTP 健康接口
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
-    CMD curl -f http://localhost:8091/health || exit 1
+    CMD curl -sf http://localhost:8091/health 2>/dev/null || ps aux | grep ssl_cert_agent.py | grep -v grep > /dev/null 2>&1 || exit 1
+
+# 默认环境变量 - 推送模式
+ENV AGENT_MODE=push
+ENV SERVER_URL=http://ssl-agent-server:8090
+ENV AGENT_LISTEN_PORT=8091
 
 # 启动命令
 CMD ["python", "ssl_cert_agent.py"]

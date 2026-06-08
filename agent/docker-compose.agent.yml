@@ -1,27 +1,81 @@
 # SSL Certificate Agent Docker 部署配置
 # 用于在远程 Agent 机器上使用 Docker 部署 SSL 证书监控 Agent
-
-version: '3.8'
+#
+# 支持三种模式（通过 AGENT_MODE 环境变量控制）：
+#   - push:  推送模式（默认），Agent 主动推送，不需要暴露端口
+#   - pull:  拉取模式，Agent 暴露端口，Server 主动拉取
+#   - dual:  双模式，同时暴露端口+推送（推荐）
+#
+# 使用方式：
+#   推送模式: docker compose up ssl-cert-agent-push
+#   拉取模式: docker compose up ssl-cert-agent-pull
+#   双模式:   docker compose up ssl-cert-agent-dual
 
 services:
-  ssl-cert-agent:
+
+  # ========== 推送模式 Agent ==========
+  # Agent 主动向 Server 推送指标和心跳，不需要暴露端口
+  # 适用于: Agent 在 NAT 后面，Server 无法直连 Agent 的场景
+  ssl-cert-agent-push:
     build: .
     image: ssl-cert-agent:latest
-    container_name: ssl-cert-agent
+    container_name: ssl-cert-agent-push
     environment:
-      # Agent 监听配置
-      - AGENT_LISTEN_HOST=0.0.0.0
-      - AGENT_LISTEN_PORT=48091
-      - AGENT_TARGETS_PATH=/app/data/targets.json
-      # Agent 身份信息（用于 Server 识别）
-      - AGENT_ID=${AGENT_ID:-}
+      - AGENT_MODE=push
+      - AGENT_ID=${AGENT_ID:-push-agent-01}
       - AGENT_HOSTNAME=${AGENT_HOSTNAME:-}
       - AGENT_IP=${AGENT_IP:-}
+      # Server 地址（必填）
+      - SERVER_URL=${SERVER_URL:-http://ssl-agent-server:8090}
       # 检测配置
       - SCRAPE_INTERVAL=${SCRAPE_INTERVAL:-180}
       - SCRAPE_TIMEOUT=${SCRAPE_TIMEOUT:-30}
+      # 推送配置
+      - PUSH_INTERVAL=${PUSH_INTERVAL:-30}
+      - SYNC_INTERVAL=${SYNC_INTERVAL:-300}
+      # 目标配置
+      - AGENT_TARGETS_PATH=/app/data/targets.json
+      # SSL 验证
+      - AGENT_VERIFY_SSL=${AGENT_VERIFY_SSL:-false}
+    volumes:
+      - ./data:/app/data
+    dns:
+      - 8.8.8.8
+      - 114.114.114.114
+    restart: unless-stopped
+    # 推送模式不需要暴露端口
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os; exit(0 if os.path.exists('/proc/1/cmdline') else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    networks:
+      - ssl-agent-network
+      #- ssl-monitoring-network
+
+  # ========== 拉取模式 Agent ==========
+  # Agent 暴露 HTTP API，Server 主动拉取数据
+  # 适用于: Agent 和 Server 在同一网络，Server 可以直连 Agent 的场景
+  ssl-cert-agent-pull:
+    build: .
+    image: ssl-cert-agent:latest
+    container_name: ssl-cert-agent-pull
+    environment:
+      - AGENT_MODE=pull
+      - AGENT_ID=${AGENT_ID:-pull-agent-01}
+      - AGENT_HOSTNAME=${AGENT_HOSTNAME:-}
+      - AGENT_IP=${AGENT_IP:-}
+      # Agent 监听配置
+      - AGENT_LISTEN_HOST=0.0.0.0
+      - AGENT_LISTEN_PORT=8091
+      # 检测配置
+      - SCRAPE_INTERVAL=${SCRAPE_INTERVAL:-180}
+      - SCRAPE_TIMEOUT=${SCRAPE_TIMEOUT:-30}
+      # 目标配置
+      - AGENT_TARGETS_PATH=/app/data/targets.json
       # HTTPS 配置（可选）
-      - AGENT_ENABLE_HTTPS=${AGENT_ENABLE_HTTPS:-true}
+      - AGENT_ENABLE_HTTPS=${AGENT_ENABLE_HTTPS:-false}
       - AGENT_VERIFY_SSL=${AGENT_VERIFY_SSL:-true}
     volumes:
       - ./data:/app/data
@@ -32,16 +86,66 @@ services:
       - 114.114.114.114
     restart: unless-stopped
     ports:
-      - "${AGENT_PORT:-48091}:48091"
+      - "${AGENT_PORT:-48091}:8091"
     healthcheck:
-      test: ["CMD", "curl", "-kf", "https://localhost:48091/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8091/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 15s
     networks:
       - ssl-agent-network
+      #- ssl-monitoring-network
+
+  # ========== 双模式 Agent（推荐）==========
+  # 同时暴露端口供 Server 拉取，又主动推送数据到 Server
+  # 适用于: 需要高可用和冗余的场景，或从拉取模式迁移到推送模式的过渡期
+  ssl-cert-agent-dual:
+    build: .
+    image: ssl-cert-agent:latest
+    container_name: ssl-cert-agent-dual
+    environment:
+      - AGENT_MODE=dual
+      - AGENT_ID=${AGENT_ID:-dual-agent-01}
+      - AGENT_HOSTNAME=${AGENT_HOSTNAME:-}
+      - AGENT_IP=${AGENT_IP:-}
+      # Server 地址（必填，dual 模式需要推送数据）
+      - SERVER_URL=${SERVER_URL:-http://ssl-agent-server:8090}
+      # Agent 监听配置
+      - AGENT_LISTEN_HOST=0.0.0.0
+      - AGENT_LISTEN_PORT=8091
+      # 检测配置
+      - SCRAPE_INTERVAL=${SCRAPE_INTERVAL:-180}
+      - SCRAPE_TIMEOUT=${SCRAPE_TIMEOUT:-30}
+      # 推送配置
+      - PUSH_INTERVAL=${PUSH_INTERVAL:-30}
+      - SYNC_INTERVAL=${SYNC_INTERVAL:-300}
+      # 目标配置
+      - AGENT_TARGETS_PATH=/app/data/targets.json
+      # SSL 验证
+      - AGENT_VERIFY_SSL=${AGENT_VERIFY_SSL:-false}
+    volumes:
+      - ./data:/app/data
+      # HTTPS 证书挂载（可选）
+      - ./certs:/app/certs:ro
+    dns:
+      - 8.8.8.8
+      - 114.114.114.114
+    restart: unless-stopped
+    ports:
+      - "${AGENT_PORT:-48091}:8091"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8091/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    networks:
+      - ssl-agent-network
+      #- ssl-monitoring-network
 
 networks:
   ssl-agent-network:
     driver: bridge
+  #ssl-monitoring-network:
+  #  external: true

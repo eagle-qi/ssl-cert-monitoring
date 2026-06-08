@@ -1,4 +1,28 @@
 services:
+  # ========== IvorySQL 数据库 ==========
+  # PostgreSQL 兼容数据库，替代 SQLite
+  # 当前使用 postgres:16 镜像，如需 IvorySQL 可替换为 ivorysql/ivorysql:3.5
+  ivorysql:
+    image: postgres:16
+    container_name: ssl-ivorysql
+    environment:
+      - POSTGRES_USER=ssl_monitor
+      - POSTGRES_PASSWORD=ssl_monitor_pass
+      - POSTGRES_DB=ssl_monitor
+    ports:
+      - "45432:5432"
+    volumes:
+      - ivorysql-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ssl_monitor -d ssl_monitor"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - default
+
   # ========== Agent Server (Server-Agent 架构服务端) ==========
   # 用于接收内网 Agent 上报的证书数据，并直接监控未分配 Agent 的目标
   # 提供 Prometheus 格式接口
@@ -7,6 +31,8 @@ services:
       context: ./server
       dockerfile: Dockerfile
     container_name: ssl-agent-server
+    ports:
+      - "48090:8090"  # 对外暴露，供 Agent 推送数据和心跳
     volumes:
       - ./data:/app/data
       - ./agent/data:/app/agent_data
@@ -16,22 +42,38 @@ services:
       - SERVER_LISTEN_HOST=0.0.0.0
       - SERVER_LISTEN_PORT=8090
       - SERVER_HTTPS_PORT=8092
+      # IvorySQL 数据库连接配置
+      - DB_HOST=ivorysql
+      - DB_PORT=5432
+      - DB_NAME=ssl_monitor
+      - DB_USER=ssl_monitor
+      - DB_PASSWORD=ssl_monitor_pass
       - SERVER_CONFIG_PATH=/app/data/server_config.json
       - SERVER_DATA_PATH=/app/data/metrics.json
       - UNIFIED_TARGETS_PATH=/app/data/ssl_targets.json
       - AGENT_TARGETS_PATH=/app/agent_data/targets.json
+      - PROMETHEUS_TARGETS_PATH=/app/data/prometheus_targets.json
       - EXPORTER_RELOAD_URL=http://ssl-custom-exporter:9116/reload
       # HTTPS 配置（可选）
       - ENABLE_HTTPS=${ENABLE_HTTPS:-false}
       - SSL_CERT_FILE=/app/certs/server.crt
       - SSL_KEY_FILE=/app/certs/server.key
       - SERVER_VERIFY_SSL=${SERVER_VERIFY_SSL:-false}
+      # 心跳超时配置（秒），超过此时间无心跳则标记 Agent 离线
+      - HEARTBEAT_TIMEOUT=${HEARTBEAT_TIMEOUT:-300}
+      # 凭证管理告警配置
+      - CREDENTIAL_ALERT_WEBHOOK=${FEISHU_WEBHOOK_URL:-}
+      - CREDENTIAL_ALERT_EMAILS=${ALERT_EMAIL_TO:-}
+      - CREDENTIAL_ALERT_CHECK_INTERVAL=${CREDENTIAL_ALERT_CHECK_INTERVAL:-3600}
     dns:
       - 8.8.8.8
       - 114.114.114.114
+    depends_on:
+      ivorysql:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-kf", "https://localhost:8092/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8090/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -143,6 +185,7 @@ services:
       - SMTP_FROM=${SMTP_FROM}
       - SMTP_USE_TLS=${SMTP_USE_TLS}
       - TARGETS_CONFIG_PATH=/app/data/ssl_targets.json,/app/data/agent_targets.json
+      - CREDENTIALS_CONFIG_PATH=/app/data/credentials.json
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
@@ -200,6 +243,14 @@ services:
       - DASHBOARD_ADMIN_PASSWORD
       - DASHBOARD_READONLY_USER
       - DASHBOARD_READONLY_PASSWORD
+      - SMTP_HOST=${SMTP_HOST}
+      - SMTP_PORT=${SMTP_PORT}
+      - SMTP_USER=${SMTP_USER}
+      - SMTP_PASSWORD=${SMTP_PASSWORD}
+      - SMTP_FROM=${SMTP_FROM}
+      - SMTP_USE_TLS=${SMTP_USE_TLS}
+      - AGENT_SERVER_INTERNAL_URL=http://ssl-agent-server:8090
+      - EXPORTER_INTERNAL_URL=http://ssl-custom-exporter:9116
     restart: unless-stopped
 
 networks:
@@ -211,3 +262,4 @@ volumes:
   prometheus-data:
   grafana-data:
   alertmanager-data:
+  ivorysql-data:

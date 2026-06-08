@@ -94,12 +94,12 @@ export function parseMetrics(text: string): SSLCertData[] {
       const isWebtrust = vals.is_webtrust as number || 0;
       
       // 计算状态
-      let status: 'valid' | 'warning' | 'critical' | 'expired' = 'valid';
+      let status: 'valid' | 'warning' | 'critical' | 'expired' | 'unreachable' = 'valid';
       let statusColor = '#10b981'; // green
       
       if (checkSuccess === 0) {
-        status = 'expired';
-        statusColor = '#ef4444'; // red
+        status = 'unreachable';
+        statusColor = '#6b7280'; // gray
       } else if (daysLeft <= 7) {
         status = 'critical';
         statusColor = '#ef4444'; // red
@@ -236,12 +236,13 @@ export function calculateStats(data: SSLCertData[]) {
   const warning = data.filter(d => d.status === 'warning').length;
   const critical = data.filter(d => d.status === 'critical').length;
   const expired = data.filter(d => d.status === 'expired').length;
+  const unreachable = data.filter(d => d.status === 'unreachable').length;
   
   const averageDaysLeft = total > 0
     ? Math.round(data.reduce((sum, d) => sum + d.days_left, 0) / total)
     : 0;
   
-  return { total, valid, warning, critical, expired, average_days_left: averageDaysLeft };
+  return { total, valid, warning, critical, expired, unreachable, average_days_left: averageDaysLeft };
 }
 
 export function filterCertificates(data: SSLCertData[], filters: {
